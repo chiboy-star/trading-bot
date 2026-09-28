@@ -1,0 +1,31 @@
+{
+  "name": "trading_bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "backtest": "node dist/src/backtester.js",
+    "runner": "node dist/src/live_runner.js",
+    "runner:dry-run": "node dist/src/live_runner.js --dry-run",
+    "runner:tradew": "node dist/src/tradew_runner.js",
+    "screener": "node dist/src/screener.js",
+    "test:alert": "node dist/scripts/test_alert.js",
+    "dashboard:dev": "npm run dev --prefix dashboard",
+    "dashboard:build": "npm run build --prefix dashboard",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ccxt": "^4.5.84",
+    "dotenv": "^18.0.4",
+    "metaapi.cloud-sdk": "^29.3.3",
+    "technicalindicators": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.2",
+    

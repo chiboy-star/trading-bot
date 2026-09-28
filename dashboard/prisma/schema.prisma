@@ -1,0 +1,65 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Candle {
+  id        Int    @id @default(autoincrement())
+  symbol    String
+  timeframe String
+  timestamp BigInt
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float
+
+  @@unique([symbol, timeframe, timestamp])
+  @@map("candles")
+}
+
+model PaperTrade {
+  id         Int    @id @default(autoincrement())
+  orderId    String @map("order_id")
+  symbol     String
+  side       String
+  type       String
+  price      Float
+  amount     Float
+  fee        Float
+  pnl        Float  @default(0)
+  pnlPercent Float  @default(0) @map("pnl_percent")
+  timestamp  BigInt
+
+  @@map("paper_trades")
+}
+
+model ActivePosition {
+  symbol       String @id
+  amount       Float
+  entryPrice   Float  @map("entry_price")
+  currentPrice Float  @map("current_price")
+  highestPrice Float  @map("highest_price")
+  trailingStop Float  @map("trailing_stop")
+  atr          Float
+  pnl          Float  @default(0)
+  pnlPercent   Float  @default(0) @map("pnl_percent")
+  entryTime    BigInt @map("entry_time")
+  updatedAt    BigInt @map("updated_at")
+
+  @@map("active_positions")
+}
+
+model BotState {
+  id                   Int    @id
+  capital              Float
+  initialCapital       Float  @map("initial_capital")
+  circuitBreakerHalted Int    @default(0) @map("circuit_breaker_halted")
+  lockoutUntil         BigInt @default(0) @map("lockout_until")
+  updatedAt            BigInt @map("updated_at")
+
+  @@map("bot_state")
+}
