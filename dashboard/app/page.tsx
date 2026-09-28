@@ -31,6 +31,7 @@ import {
 import type { DashboardData, TradeRecord } from '@/lib/db';
 import EngineReasoning from './components/EngineReasoning';
 import ForexEngineView from './components/ForexEngineView';
+import TradeWEngineView from './components/TradeWEngineView';
 
 // Dynamically import CandlestickChart to prevent SSR canvas issues
 const CandlestickChart = dynamic(() => import('./components/CandlestickChart'), {
@@ -80,8 +81,8 @@ export default function DashboardPage() {
     const [isValidating, setIsValidating] = useState<boolean>(false);
     const [lastSyncTime, setLastSyncTime] = useState<string>('Syncing...');
 
-    // Market Navigation: Crypto vs Forex
-    const [marketEngine, setMarketEngine] = useState<'crypto' | 'forex'>('crypto');
+    // Market Navigation: Bybit Crypto vs OANDA Forex vs Trade W (MT5)
+    const [marketEngine, setMarketEngine] = useState<'crypto' | 'forex' | 'tradew'>('crypto');
 
     // Chart Selected Asset
     const [selectedChartSymbol, setSelectedChartSymbol] = useState<string>('BTC/USDT');
@@ -134,13 +135,31 @@ export default function DashboardPage() {
     }, [symbolFilter, statusFilter, directionFilter, searchQuery, pageSize, executionModeFilter]);
 
     // Counts for Segmented Control
-    const liveForwardCount = useMemo(() => tradeHistory.filter((t) => t.executionMode === 'LIVE_FORWARD').length, [tradeHistory]);
-    const historicalBacktestCount = useMemo(() => tradeHistory.filter((t) => t.executionMode === 'BACKTEST_MOCK').length, [tradeHistory]);
+    const liveForwardCount = useMemo(() => {
+        return tradeHistory.filter((t) => {
+            if (marketEngine === 'tradew') return t.broker === 'TRADE_W' && t.executionMode === 'LIVE_FORWARD';
+            if (marketEngine === 'crypto') return (t.broker === 'BYBIT' || !t.broker) && t.executionMode === 'LIVE_FORWARD';
+            return t.executionMode === 'LIVE_FORWARD';
+        }).length;
+    }, [tradeHistory, marketEngine]);
+
+    const historicalBacktestCount = useMemo(() => {
+        return tradeHistory.filter((t) => {
+            if (marketEngine === 'tradew') return t.broker === 'TRADE_W' && t.executionMode === 'BACKTEST_MOCK';
+            if (marketEngine === 'crypto') return (t.broker === 'BYBIT' || !t.broker) && t.executionMode === 'BACKTEST_MOCK';
+            return t.executionMode === 'BACKTEST_MOCK';
+        }).length;
+    }, [tradeHistory, marketEngine]);
 
     // Filter and Sort Trade History
     const filteredTrades = useMemo(() => {
         return tradeHistory
             .filter((trade) => {
+                if (marketEngine === 'tradew') {
+                    if (trade.broker !== 'TRADE_W') return false;
+                } else if (marketEngine === 'crypto') {
+                    if (trade.broker && trade.broker !== 'BYBIT') return false;
+                }
                 if (trade.executionMode !== executionModeFilter) return false;
                 if (symbolFilter !== 'ALL' && trade.symbol !== symbolFilter) return false;
                 if (statusFilter === 'WIN' && trade.status !== 'WIN') return false;
@@ -168,7 +187,7 @@ export default function DashboardPage() {
                 }
                 return sortDirection === 'asc' ? (valA as number) - (valB as number) : (valB as number) - (valA as number);
             });
-    }, [tradeHistory, executionModeFilter, symbolFilter, statusFilter, directionFilter, searchQuery, sortField, sortDirection]);
+    }, [tradeHistory, marketEngine, executionModeFilter, symbolFilter, statusFilter, directionFilter, searchQuery, sortField, sortDirection]);
 
     // Pagination Calculations
     const totalPages = Math.max(1, Math.ceil(filteredTrades.length / pageSize));
@@ -224,7 +243,7 @@ export default function DashboardPage() {
                                 QuantEngine
                             </h1>
                             <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 tracking-wider">
-                                {marketEngine === 'crypto' ? 'CRYPTO LIVE' : 'FOREX DEMO'}
+                                {marketEngine === 'crypto' ? 'BYBIT CRYPTO' : marketEngine === 'forex' ? 'OANDA FOREX' : 'TRADE W (MT5)'}
                             </span>
                             <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 tracking-wider flex items-center gap-1">
                                 <Banknote className="w-3 h-3" />
@@ -239,7 +258,7 @@ export default function DashboardPage() {
 
                 {/* Multi-Market Toggle & Status Badges */}
                 <div className="flex items-center flex-wrap gap-3">
-                    {/* Multi-Market Navigation Switcher */}
+                    {/* Multi-Market Navigation Switcher: [Bybit Crypto], [OANDA Forex], [Trade W (MT5)] */}
                     <div className="flex items-center bg-[#07090E] p-1 rounded-xl border border-slate-800 shadow-inner">
                         <button
                             onClick={() => setMarketEngine('crypto')}
@@ -250,7 +269,7 @@ export default function DashboardPage() {
                             }`}
                         >
                             <Zap className="w-3.5 h-3.5" />
-                            <span>Crypto Engine</span>
+                            <span>Bybit Crypto</span>
                         </button>
                         <button
                             onClick={() => setMarketEngine('forex')}
@@ -261,7 +280,18 @@ export default function DashboardPage() {
                             }`}
                         >
                             <Globe className="w-3.5 h-3.5" />
-                            <span>Forex Engine (OANDA Demo)</span>
+                            <span>OANDA Forex</span>
+                        </button>
+                        <button
+                            onClick={() => setMarketEngine('tradew')}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                                marketEngine === 'tradew'
+                                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20'
+                                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
+                            }`}
+                        >
+                            <Layers className="w-3.5 h-3.5" />
+                            <span>Trade W (MT5)</span>
                         </button>
                     </div>
 
@@ -314,10 +344,21 @@ export default function DashboardPage() {
             {/* Dashboard Body Container */}
             <div className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
                 {marketEngine === 'forex' ? (
-                    /* FOREX ENGINE VIEW (OANDA Demo Scaffolding) */
+                    /* FOREX ENGINE VIEW (OANDA Forex) */
                     <ForexEngineView />
+                ) : marketEngine === 'tradew' ? (
+                    /* TRADE W (MT5) ENGINE VIEW */
+                    <TradeWEngineView
+                        tradewAccount={data?.tradewAccount}
+                        activePositions={activePositions}
+                        tradeHistory={tradeHistory}
+                        engineReasoning={engineReasoning}
+                        chartData={chartData}
+                        formatNGN={formatNGN}
+                        formatPnlNGN={formatPnlNGN}
+                    />
                 ) : (
-                    /* CRYPTO ENGINE VIEW */
+                    /* BYBIT CRYPTO ENGINE VIEW */
                     <>
                         {/* Practice Mode Banner */}
                         <div className="bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent border border-amber-500/20 rounded-2xl px-5 py-3.5 flex items-center gap-3 shadow-lg shadow-black/20">

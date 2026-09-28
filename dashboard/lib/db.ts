@@ -138,6 +138,7 @@ export interface TradeRecord {
     status: 'WIN' | 'LOSS' | 'ENTRY';
     direction: 'LONG' | 'SHORT';
     executionMode: 'LIVE_FORWARD' | 'BACKTEST_MOCK';
+    broker?: 'BYBIT' | 'OANDA' | 'TRADE_W' | string;
 }
 
 export interface ActivePositionRecord {
@@ -156,6 +157,22 @@ export interface ActivePositionRecord {
     pnlPercent: number;
     entryTime: number;
     holdingDuration: string;
+    broker?: 'BYBIT' | 'OANDA' | 'TRADE_W' | string;
+}
+
+export interface TradeWAccountMetrics {
+    balance: number;
+    equity: number;
+    freeMargin: number;
+    margin: number;
+    marginLevel: number;
+    leverage: number;
+    currency: string;
+    server: string;
+    platform: string;
+    activeCfdCount: number;
+    connected: boolean;
+    lastUpdated: number;
 }
 
 export interface MetricsSummary {
@@ -240,6 +257,7 @@ export interface DashboardData {
     metrics: MetricsSummary;
     activePositions: ActivePositionRecord[];
     tradeHistory: TradeRecord[];
+    tradewAccount: TradeWAccountMetrics;
     marketOverview: {
         symbol: string;
         latestClose: number;
@@ -505,7 +523,8 @@ export function fetchDashboardData(): DashboardData {
             pnl: Number(row.pnl),
             pnlPercent: Number(row.pnl_percent),
             entryTime: Number(row.entry_time),
-            holdingDuration: durationStr
+            holdingDuration: durationStr,
+            broker: row.broker || 'BYBIT'
         };
 
         activePositionsMap.set(row.symbol, record);
@@ -553,7 +572,8 @@ export function fetchDashboardData(): DashboardData {
             }),
             status,
             direction,
-            executionMode: (t.execution_mode === 'BACKTEST_MOCK' ? 'BACKTEST_MOCK' : 'LIVE_FORWARD') as 'LIVE_FORWARD' | 'BACKTEST_MOCK'
+            executionMode: (t.execution_mode === 'BACKTEST_MOCK' ? 'BACKTEST_MOCK' : 'LIVE_FORWARD') as 'LIVE_FORWARD' | 'BACKTEST_MOCK',
+            broker: t.broker || 'BYBIT'
         };
     });
 
@@ -591,8 +611,8 @@ export function fetchDashboardData(): DashboardData {
         }
     } catch (e) {}
 
-    // Combine core symbols and screened symbols
-    const pairSet = new Set(['BTC/USDT', 'ETH/USDT', 'SOL/USDT']);
+    // Combine core symbols, Trade W symbol (ETC/USDT), and screened symbols
+    const pairSet = new Set(['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'ETC/USDT']);
     screenedPairs.forEach(p => pairSet.add(p.symbol));
     activePositions.forEach(p => pairSet.add(p.symbol));
 
@@ -644,6 +664,43 @@ export function fetchDashboardData(): DashboardData {
         };
     });
 
+    // 6. Trade W MT4/MT5 Account Metrics
+    let tradewAccount: TradeWAccountMetrics = {
+        balance: 10000.00,
+        equity: 10000.00,
+        freeMargin: 10000.00,
+        margin: 0.00,
+        marginLevel: 0.00,
+        leverage: 100,
+        currency: 'USD',
+        server: 'TradeW-Live',
+        platform: 'MT5',
+        activeCfdCount: activePositions.filter(p => p.broker === 'TRADE_W').length,
+        connected: true,
+        lastUpdated: Date.now()
+    };
+
+    try {
+        const accRow = db.prepare('SELECT * FROM tradew_account WHERE id = 1').get() as any;
+        if (accRow) {
+            const activeCfdCount = activePositions.filter(p => p.broker === 'TRADE_W').length;
+            tradewAccount = {
+                balance: Number(accRow.balance || 10000.00),
+                equity: Number(accRow.equity || 10000.00),
+                freeMargin: Number(accRow.free_margin || 10000.00),
+                margin: Number(accRow.margin || 0),
+                marginLevel: Number(accRow.margin_level || 0),
+                leverage: Number(accRow.leverage || 100),
+                currency: accRow.currency || 'USD',
+                server: accRow.server || 'TradeW-Live',
+                platform: accRow.platform || 'MT5',
+                activeCfdCount: activeCfdCount > 0 ? activeCfdCount : Number(accRow.active_cfd_count || 0),
+                connected: Boolean(accRow.connected ?? true),
+                lastUpdated: Number(accRow.updated_at || Date.now())
+            };
+        }
+    } catch (e) {}
+
     return {
         metrics: {
             capital: currentCapital,
@@ -663,6 +720,7 @@ export function fetchDashboardData(): DashboardData {
         },
         activePositions,
         tradeHistory,
+        tradewAccount,
         marketOverview,
         engineReasoning,
         chartData,
