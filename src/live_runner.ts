@@ -87,6 +87,12 @@ db.exec(`
         rank INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS daily_losses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        amount REAL NOT NULL
+    );
 `);
 
 // Safe column migrations for existing databases
@@ -167,11 +173,20 @@ const deleteActivePosStmt = db.prepare(`
     DELETE FROM active_positions WHERE symbol = ?
 `);
 
+const insertDailyLossStmt = db.prepare(`
+    INSERT INTO daily_losses (timestamp, amount) VALUES (?, ?)
+`);
+
+const cleanOldLossesStmt = db.prepare(`
+    DELETE FROM daily_losses WHERE timestamp < ?
+`);
+
 const updateBotStateStmt = db.prepare(`
     INSERT INTO bot_state (id, capital, initial_capital, circuit_breaker_halted, lockout_until, updated_at)
     VALUES (1, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
         capital = excluded.capital,
+        initial_capital = excluded.initial_capital,
         circuit_breaker_halted = excluded.circuit_breaker_halted,
         lockout_until = excluded.lockout_until,
         updated_at = excluded.updated_at;
@@ -198,20 +213,24 @@ function maybePrintSummary() {
     const now = Date.now();
     if (now - lastSummaryTime >= SUMMARY_INTERVAL) {
         lastSummaryTime = now;
+        // Use latest DB current_price for accurate unrealized PnL (not watermarks)
         const totalUnrealized = Array.from(positions.values()).reduce((sum, p) => {
+            const posRow = db.prepare('SELECT current_price FROM active_positions WHERE symbol = ?').get(p.symbol) as { current_price: number } | undefined;
+            const curPrice = posRow ? posRow.current_price : p.entryPrice;
             if (p.side === 'LONG') {
-                return sum + (p.amount * p.highestPrice - p.amount * p.entryPrice);
+                return sum + (p.amount * curPrice - p.amount * p.entryPrice);
             } else {
-                return sum + (p.amount * p.entryPrice - p.amount * p.lowestPrice);
+                return sum + (p.amount * p.entryPrice - p.amount * curPrice);
             }
         }, 0);
         const pnlPct = ((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100);
         const pnlSign = pnlPct >= 0 ? '+' : '';
+        const unrealizedSign = totalUnrealized >= 0 ? '+' : '';
         console.log(`\n${C.CYAN}${C.BOLD}⏰ 5-MIN STATUS UPDATE${C.RESET}`);
         console.log(`${C.CYAN}───────────────────────────────────────────────────${C.RESET}`);
         console.log(`   💰 Balance: $${capital.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}% overall)`);
         console.log(`   📊 Watching: ${monitoredSymbols.length} coins (${monitoredSymbols.join(', ')})`);
-        console.log(`   📂 Open Trades: ${positions.size}`);
+        console.log(`   📂 Open Trades: ${positions.size} | Unrealized: ${unrealizedSign}$${Math.abs(totalUnrealized).toFixed(2)}`);
         if (positions.size > 0) {
             for (const [sym, pos] of positions) {
                 const dirEmoji = pos.side === 'LONG' ? '🟢' : '🔴';
@@ -251,6 +270,15 @@ let dailyLosses: { timestamp: number, amount: number }[] = [];
 let lockoutUntil = 0;
 let monitoredSymbols: string[] = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
 
+/**
+ * Persists a loss record to SQLite and adds it to the in-memory array.
+ * This ensures the circuit breaker survives bot restarts.
+ */
+function recordDailyLoss(timestamp: number, amount: number) {
+    dailyLosses.push({ timestamp, amount });
+    insertDailyLossStmt.run(timestamp, amount);
+}
+
 // Restore capital and positions from SQLite if present
 (() => {
     const state = db.prepare('SELECT capital, circuit_breaker_halted, lockout_until FROM bot_state WHERE id = 1').get() as any;
@@ -260,6 +288,12 @@ let monitoredSymbols: string[] = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
     } else {
         updateBotStateStmt.run(INITIAL_CAPITAL, INITIAL_CAPITAL, 0, 0, Date.now());
     }
+
+    // Restore daily losses from SQLite (rolling 24h window)
+    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+    cleanOldLossesStmt.run(twentyFourHoursAgo);
+    const savedLosses = db.prepare('SELECT timestamp, amount FROM daily_losses ORDER BY timestamp ASC').all() as { timestamp: number, amount: number }[];
+    dailyLosses = savedLosses;
 
     const savedPositions = db.prepare('SELECT * FROM active_positions').all() as any[];
     for (const p of savedPositions) {
@@ -297,7 +331,7 @@ export function getPositions() {
 }
 
 function generateOrderId() {
-    return 'ORD-' + Math.random().toString(36).substring(2, 9).toUpperCase();
+    return 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
 function logTrade(
@@ -324,13 +358,15 @@ function logTrade(
 }
 
 function checkCircuitBreaker(timestamp: number): boolean {
-    if (timestamp < lockoutUntil) {
+    const now = Date.now();
+    if (now < lockoutUntil || timestamp < lockoutUntil) {
         return true; // Locked out
     }
 
-    // Clean old losses (> 24h rolling window)
+    // Clean old losses (> 24h rolling window) from memory and DB
     const twentyFourHours = 24 * 60 * 60 * 1000;
     dailyLosses = dailyLosses.filter(l => (timestamp - l.timestamp) <= twentyFourHours);
+    cleanOldLossesStmt.run(timestamp - twentyFourHours);
     
     const totalLoss = dailyLosses.reduce((sum, l) => sum + l.amount, 0);
     if (totalLoss >= capital * 0.05) {
@@ -527,7 +563,7 @@ export async function processTick(
                 console.log(`${C.YELLOW}⚡ Auto-exit triggered:${C.RESET} ${symbol} price ($${low.toFixed(2)}) dropped below safety stop ($${pos.trailingStop.toFixed(2)}) — closing to protect capital`);
                 
                 if (pnl < 0) {
-                    dailyLosses.push({ timestamp, amount: Math.abs(pnl) });
+                    recordDailyLoss(timestamp, Math.abs(pnl));
                 }
                 capital += netValue;
                 logTrade(symbol, 'SELL', 'TRAILING_STOP', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
@@ -563,7 +599,7 @@ export async function processTick(
                     const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
 
                     if (pnl < 0) {
-                        dailyLosses.push({ timestamp, amount: Math.abs(pnl) });
+                        recordDailyLoss(timestamp, Math.abs(pnl));
                     }
                     capital += netValue;
                     logTrade(symbol, 'SELL', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
@@ -630,7 +666,7 @@ export async function processTick(
                 console.log(`${C.YELLOW}⚡ Auto-exit triggered:${C.RESET} ${symbol} price ($${high.toFixed(2)}) rose above safety stop ($${pos.trailingStop.toFixed(2)}) — closing short to protect capital`);
                 
                 if (pnl < 0) {
-                    dailyLosses.push({ timestamp, amount: Math.abs(pnl) });
+                    recordDailyLoss(timestamp, Math.abs(pnl));
                 }
                 // Return original collateral plus realized PnL
                 capital += (pos.amount * pos.entryPrice) + pnl;
@@ -666,7 +702,7 @@ export async function processTick(
                     const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
 
                     if (pnl < 0) {
-                        dailyLosses.push({ timestamp, amount: Math.abs(pnl) });
+                        recordDailyLoss(timestamp, Math.abs(pnl));
                     }
                     capital += (pos.amount * pos.entryPrice) + pnl;
                     logTrade(symbol, 'BUY', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'SHORT', 'LIVE_FORWARD');
@@ -786,7 +822,8 @@ export async function processTick(
                     amount: positionSize,
                     initialStop: initialTrailingStop,
                     atr: currentAtr,
-                    timestamp
+                    timestamp,
+                    direction: 'LONG'
                 }).catch(err => console.error("Discord alert error:", err));
 
                 console.log(`${C.BLUE}   💰 Position opened:${C.RESET} Size: ${positionSize.toFixed(4)} | Safety stop at: $${initialTrailingStop.toFixed(2)} | Remaining balance: $${capital.toFixed(2)}`);
@@ -862,7 +899,8 @@ export async function processTick(
                     amount: positionSize,
                     initialStop: initialTrailingStop,
                     atr: currentAtr,
-                    timestamp
+                    timestamp,
+                    direction: 'SHORT'
                 }).catch(err => console.error("Discord alert error:", err));
 
                 console.log(`${C.MAGENTA}   💰 Short position opened:${C.RESET} Size: ${positionSize.toFixed(4)} | Safety stop at: $${initialTrailingStop.toFixed(2)} | Remaining balance: $${capital.toFixed(2)}`);
@@ -879,7 +917,8 @@ export async function runDryRun() {
     console.log(` [DRY RUN VERIFICATION] REAL-TIME BIDIRECTIONAL PERPETUAL ENGINE`);
     console.log(` Monitored Pairs: ${monitoredSymbols.join(', ')}`);
     console.log(`========================================================================================`);
-    const exchange = new ccxt.bybit({ options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
+    const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
+    const exchange = new ccxt.bybit({ hostname: bybitHostname, options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
 
     await seedHistoryIfNeeded(exchange);
 
@@ -918,7 +957,8 @@ export async function runDryRun() {
  * Schedules 24-hour screener update.
  */
 export async function startLive() {
-    const exchange = new ccxt.bybit({ options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
+    const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
+    const exchange = new ccxt.bybit({ hostname: bybitHostname, options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
     const lastTimestamps: Record<string, number> = {};
 
     console.log(`\n${C.CYAN}${C.BOLD}╔══════════════════════════════════════════════════════════════════════════╗${C.RESET}`);
@@ -943,8 +983,9 @@ export async function startLive() {
     console.log(`   ${C.DIM}Starting balance: $${capital.toFixed(2)} USDT${C.RESET}`);
     console.log(`${'─'.repeat(74)}\n`);
 
-    // Start 24-hour automated screener background schedule
+    // Start 24-hour automated screener background schedule and run initial scan
     const screener = new DynamicAssetScreener();
+    screener.runScreening().catch(err => console.error("Initial screening error:", err));
     screener.schedule24Hours();
 
     // Pre-seed any uninitialized symbols

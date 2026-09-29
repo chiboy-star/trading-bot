@@ -39,7 +39,7 @@ try {
     const cols = db.prepare("PRAGMA table_info(paper_trades)").all() as { name: string }[];
     const colNames = cols.map(c => c.name);
     if (!colNames.includes('broker')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN broker TEXT DEFAULT 'BYBIT';");
+        db.exec("ALTER TABLE paper_trades ADD COLUMN broker TEXT DEFAULT 'OANDA';");
     }
 } catch (e) {}
 

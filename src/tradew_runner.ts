@@ -462,7 +462,8 @@ function syncAccountToDb(): void {
  */
 async function fetchEtcCandles(limit: number = 150): Promise<MTCandle[]> {
     try {
-        const exchange = new ccxt.bybit({ enableRateLimit: true });
+        const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
+        const exchange = new ccxt.bybit({ hostname: bybitHostname, enableRateLimit: true });
         const ohlcv = await exchange.fetchOHLCV(TARGET_SYMBOL, TIMEFRAME, undefined, limit);
         if (ohlcv && ohlcv.length > 0) {
             return ohlcv.map(c => ({

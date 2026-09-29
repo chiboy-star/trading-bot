@@ -123,7 +123,12 @@ export default function DashboardPage() {
     }, [fetchData]);
 
     const metrics = data?.metrics;
-    const activePositions = data?.activePositions || [];
+    const allActivePositions = data?.activePositions || [];
+    const activePositions = useMemo(() => {
+        if (marketEngine === 'tradew') return allActivePositions.filter(p => p.broker === 'TRADE_W');
+        if (marketEngine === 'forex') return allActivePositions.filter(p => p.broker === 'OANDA');
+        return allActivePositions.filter(p => p.broker === 'BYBIT' || !p.broker);
+    }, [allActivePositions, marketEngine]);
     const tradeHistory = data?.tradeHistory || [];
     const marketOverview = data?.marketOverview || [];
     const engineReasoning = data?.engineReasoning || [];
@@ -298,7 +303,7 @@ export default function DashboardPage() {
                     {/* FX Peg Indicator */}
                     <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
                         <span className="text-slate-400 font-normal">FX Peg:</span>
-                        <span>1 USD/USDT = ₦1,325.71</span>
+                        <span>1 USD/USDT = ₦{USDT_TO_NGN_RATE.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                     </div>
 
                     {/* Circuit Breaker Status Pill */}
@@ -388,11 +393,11 @@ export default function DashboardPage() {
                                     </div>
                                 </div>
                                 <div className="text-2xl font-black tracking-tight text-white">
-                                    ₦13,257,100.00
+                                    {formatNGN(initialCapitalUSDT)}
                                 </div>
                                 <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
                                     <span>Starting Allocation</span>
-                                    <span className="text-[11px] text-slate-400 font-mono font-medium">$10,000 USDT</span>
+                                    <span className="text-[11px] text-slate-400 font-mono font-medium">${initialCapitalUSDT.toLocaleString()} USDT</span>
                                 </div>
                             </div>
 
@@ -472,7 +477,7 @@ export default function DashboardPage() {
                                         {(metrics?.netPnlPercent ?? 0).toFixed(2)}%
                                     </span>
                                     <span className="text-slate-400 cursor-help" title="Profit Factor = total money gained ÷ total money lost. Above 1.0 = profitable. Above 1.5 = good. Above 2.0 = excellent.">
-                                        PF: {metrics?.profitFactor ? (metrics.profitFactor === 999 ? '∞' : metrics.profitFactor.toFixed(2)) : '1.65'}
+                                        PF: {metrics?.profitFactor ? (metrics.profitFactor === 999 ? '∞' : metrics.profitFactor.toFixed(2)) : '—'}
                                         <span className="ml-1 text-[10px] text-slate-500">ⓘ</span>
                                     </span>
                                 </div>
@@ -575,7 +580,7 @@ export default function DashboardPage() {
                                     </div>
                                     <h3 className="text-sm font-semibold text-slate-200">No Active Positions Currently Open</h3>
                                     <p className="text-xs text-slate-400 max-w-md mt-1">
-                                        Engine is actively monitoring BTC/USDT, ETH/USDT, and SOL/USDT for confirmed 20/50 EMA Golden Cross, RSI (40-65), and ADX &gt; 25 trend strength.
+                                        Engine is actively monitoring {availableChartSymbols.length > 0 ? availableChartSymbols.slice(0, 5).join(', ') : 'selected pairs'} for confirmed 20/50 EMA crossover, RSI momentum, and ADX &gt; 25 trend strength.
                                     </p>
                                     <div className="mt-4 flex items-center gap-2 text-[11px] text-cyan-400 bg-cyan-500/10 border border-cyan-500/20 px-3 py-1 rounded-full font-medium">
                                         <CheckCircle2 className="w-3.5 h-3.5" />
@@ -977,7 +982,7 @@ export default function DashboardPage() {
                                             </tr>
                                         ) : (
                                             paginatedTrades.map((t) => {
-                                                const isSell = t.side === 'SELL';
+                                                const isExit = t.type !== 'ENTRY' && t.status !== 'ENTRY';
                                                 const isWin = t.pnl > 0;
                                                 return (
                                                     <tr key={t.id} className="hover:bg-slate-800/30 transition-colors">
@@ -1021,7 +1026,7 @@ export default function DashboardPage() {
                                                             {formatNGN(t.fee)}
                                                         </td>
                                                         <td className="py-3 px-4 text-right font-bold">
-                                                            {isSell ? (
+                                                            {isExit ? (
                                                                 <span className={isWin ? 'text-emerald-400' : 'text-red-400'}>
                                                                     {formatPnlNGN(t.pnl)} ({isWin ? '+' : ''}{t.pnlPercent.toFixed(2)}%)
                                                                 </span>
@@ -1116,6 +1121,25 @@ export default function DashboardPage() {
                     </>
                 )}
             </div>
+
+            {/* Footer */}
+            <footer className="mt-auto border-t border-slate-800/80 bg-[#090D16]/90 py-5 px-6 text-xs text-slate-400">
+                <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                        <span className="font-semibold text-slate-300">QuantEngine v1.0.0</span>
+                        <span className="text-slate-600">•</span>
+                        <span>Paper Trading Simulation</span>
+                        <span className="text-slate-600">•</span>
+                        <span className="text-amber-400/90 font-medium">No real funds at risk</span>
+                    </div>
+                    <div className="flex items-center gap-4 text-slate-400">
+                        <span>Synced every 10s</span>
+                        <span className="text-slate-600">•</span>
+                        <span>Risk Target: 2% / Pos • Max DD: 5%</span>
+                    </div>
+                </div>
+            </footer>
         </main>
     );
 }

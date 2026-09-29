@@ -1,47 +1,47 @@
 [
   {
-    "symbol": "ARK/USDT:USDT",
-    "normalizedSymbol": "ARK/USDT",
-    "baseAsset": "ARK",
-    "quoteAsset": "USDT",
-    "volume24h": 39609464.156,
-    "dailyAdx": 82.62,
-    "rank": 1
-  },
-  {
     "symbol": "NEAR/USDT:USDT",
     "normalizedSymbol": "NEAR/USDT",
     "baseAsset": "NEAR",
     "quoteAsset": "USDT",
-    "volume24h": 308290083.9473,
-    "dailyAdx": 76.7,
-    "rank": 2
+    "volume24h": 340372042.7947,
+    "dailyAdx": 72.13,
+    "rank": 1
   },
   {
     "symbol": "UNI/USDT:USDT",
     "normalizedSymbol": "UNI/USDT",
     "baseAsset": "UNI",
     "quoteAsset": "USDT",
-    "volume24h": 59313214.4119,
-    "dailyAdx": 73.65,
+    "volume24h": 70324101.6867,
+    "dailyAdx": 67.46,
+    "rank": 2
+  },
+  {
+    "symbol": "BTW/USDT:USDT",
+    "normalizedSymbol": "BTW/USDT",
+    "baseAsset": "BTW",
+    "quoteAsset": "USDT",
+    "volume24h": 35359906.4931,
+    "dailyAdx": 60.78,
     "rank": 3
   },
   {
-    "symbol": "AKE/USDT:USDT",
-    "normalizedSymbol": "AKE/USDT",
-    "baseAsset": "AKE",
+    "symbol": "ZEC/USDT:USDT",
+    "normalizedSymbol": "ZEC/USDT",
+    "baseAsset": "ZEC",
     "quoteAsset": "USDT",
-    "volume24h": 39273811.5914,
-    "dailyAdx": 70.94,
+    "volume24h": 786862536.9374,
+    "dailyAdx": 60.24,
     "rank": 4
   },
   {
-    "symbol": "PHA/USDT:USDT",
-    "normalizedSymbol": "PHA/USDT",
-    "baseAsset": "PHA",
+    "symbol": "0G/USDT:USDT",
+    "normalizedSymbol": "0G/USDT",
+    "baseAsset": "0G",
     "quoteAsset": "USDT",
-    "volume24h": 76871764.6457,
-    "dailyAdx": 69.15,
+    "volume24h": 40203376.489,
+    "dailyAdx": 54.99,
     "rank": 5
   }
 ]

@@ -58,7 +58,9 @@ export class DynamicAssetScreener {
     private exchange: any;
 
     constructor() {
+        const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
         this.exchange = new ccxt.bybit({
+            hostname: bybitHostname,
             options: { defaultType: 'future' },
             timeout: 30000,
             enableRateLimit: true
@@ -202,36 +204,43 @@ export class DynamicAssetScreener {
         const now = Date.now();
         const screenedList: ScreenedPair[] = [];
 
-        // Clear existing monitored pairs and insert newly screened ones
-        db.prepare('DELETE FROM monitored_pairs').run();
+        // Clear existing monitored pairs and insert newly screened ones atomically in a single transaction
+        const updatePairsTx = db.transaction(() => {
+            db.prepare('DELETE FROM monitored_pairs').run();
+            top5.forEach((p, idx) => {
+                const rank = idx + 1;
+                const normalized = this.normalizeSymbol(p.symbol);
+                const record: ScreenedPair = {
+                    symbol: p.symbol,
+                    normalizedSymbol: normalized,
+                    baseAsset: p.base,
+                    quoteAsset: 'USDT',
+                    volume24h: p.quoteVolume,
+                    dailyAdx: Number(p.dailyAdx.toFixed(2)),
+                    rank
+                };
+                screenedList.push(record);
+
+                // Persist to SQLite
+                upsertMonitoredPairStmt.run(
+                    normalized,
+                    p.base,
+                    'USDT',
+                    record.dailyAdx,
+                    p.quoteVolume,
+                    rank,
+                    now
+                );
+            });
+        });
+        updatePairsTx();
 
         top5.forEach((p, idx) => {
             const rank = idx + 1;
             const normalized = this.normalizeSymbol(p.symbol);
-            const record: ScreenedPair = {
-                symbol: p.symbol,
-                normalizedSymbol: normalized,
-                baseAsset: p.base,
-                quoteAsset: 'USDT',
-                volume24h: p.quoteVolume,
-                dailyAdx: Number(p.dailyAdx.toFixed(2)),
-                rank
-            };
-            screenedList.push(record);
-
-            // Persist to SQLite
-            upsertMonitoredPairStmt.run(
-                normalized,
-                p.base,
-                'USDT',
-                record.dailyAdx,
-                p.quoteVolume,
-                rank,
-                now
-            );
-
+            const adx = Number(p.dailyAdx.toFixed(2));
             console.log(
-                ` #${rank}   | ${normalized.padEnd(15)} | ${record.dailyAdx.toFixed(1).padEnd(7)} | $${Math.round(p.quoteVolume).toLocaleString().padEnd(16)} | \x1b[32mSTRONG TREND (>25)\x1b[0m`
+                ` #${rank}   | ${normalized.padEnd(15)} | ${adx.toFixed(1).padEnd(7)} | $${Math.round(p.quoteVolume).toLocaleString().padEnd(16)} | \x1b[32mSTRONG TREND (>25)\x1b[0m`
             );
         });
 

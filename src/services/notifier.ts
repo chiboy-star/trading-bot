@@ -11,6 +11,7 @@ export interface OrderEnteredParams {
     initialStop: number;
     atr?: number;
     timestamp: number;
+    direction?: 'LONG' | 'SHORT';
 }
 
 export interface PositionClosedParams {
@@ -91,16 +92,20 @@ export async function sendDiscordAlert(embed: DiscordEmbed): Promise<boolean> {
 export async function notifyOrderEntered(data: OrderEnteredParams): Promise<boolean> {
     const isoTime = new Date(data.timestamp).toISOString();
     const cost = data.amount * data.entryPrice;
+    const isShort = data.direction === 'SHORT';
+    const dirLabel = isShort ? 'Short' : 'Long';
+    const crossLabel = isShort ? '20/50 EMA Death Cross (20 EMA crossed below 50 EMA)' : '20/50 EMA Golden Cross';
 
     const embed: DiscordEmbed = {
-        title: `🟢 [ORDER ENTERED] ${data.symbol}`,
-        description: `Long position opened following 20/50 EMA Golden Cross confirmation with ADX > 25 & RSI in [40-65].`,
-        color: 3066993, // Green
+        title: `${isShort ? '🔴' : '🟢'} [ORDER ENTERED] ${data.symbol} (${dirLabel.toUpperCase()})`,
+        description: `${dirLabel} position opened following ${crossLabel} confirmation with ADX > 25 & RSI momentum filter.`,
+        color: isShort ? 15158332 : 3066993, // Red (0xE74C3C) if Short, Green (0x2ECC71) if Long
         fields: [
+            { name: "Direction", value: `**${dirLabel.toUpperCase()}**`, inline: true },
             { name: "Pair", value: `\`${data.symbol}\``, inline: true },
             { name: "Entry Price", value: `**$${data.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**`, inline: true },
-            { name: "Position Size", value: `${data.amount.toFixed(4)} (\~$${cost.toFixed(2)})`, inline: true },
-            { name: "Initial Stop-Loss (1.5x ATR)", value: `\`$${data.initialStop.toFixed(2)}\``, inline: true },
+            { name: "Position Size", value: `${data.amount.toFixed(4)} (~$${cost.toFixed(2)})`, inline: true },
+            { name: isShort ? "Initial Stop-Loss (Above Entry)" : "Initial Stop-Loss (1.5x ATR)", value: `\`$${data.initialStop.toFixed(2)}\``, inline: true },
             ...(data.atr ? [{ name: "ATR (14)", value: `$${data.atr.toFixed(2)}`, inline: true }] : []),
             { name: "Timestamp", value: isoTime, inline: false }
         ],
@@ -123,9 +128,13 @@ export async function notifyPositionClosed(data: PositionClosedParams): Promise<
     const pnlFormatted = `${pnlSign}${Math.abs(data.pnl).toFixed(2)} (${pnlPctSign}${data.pnlPercent.toFixed(2)}%)`;
 
     const readableReason = data.reason === 'TRAILING_STOP' 
-        ? 'Dynamic 1.5x ATR Trailing Stop Hit'
+        ? 'Dynamic 1.5x ATR Trailing Stop Hit (Long)'
+        : data.reason === 'TRAILING_STOP (SHORT)'
+        ? 'Dynamic 1.5x ATR Trailing Stop Hit (Short)'
         : data.reason === 'EMA_CROSS'
         ? 'Trend Reversal (20 EMA crossed below 50 EMA)'
+        : data.reason === 'EMA_CROSS (SHORT)'
+        ? 'Trend Reversal (20 EMA crossed above 50 EMA)'
         : data.reason;
 
     const embed: DiscordEmbed = {

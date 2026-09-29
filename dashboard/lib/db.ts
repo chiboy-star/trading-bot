@@ -642,24 +642,28 @@ export function fetchDashboardData(): DashboardData {
         engineReasoning.push(reasoning);
         chartData[sym] = chartCandles;
 
-        // Use actual 24-hour range across last 24 hourly candles
+        // Use actual 24-hour range across last 24 hourly candles via subquery
         const range24h = db.prepare(`
             SELECT 
                 MAX(high) as high_24h,
                 MIN(low) as low_24h,
+                SUM(volume) as volume_24h,
                 MAX(volume) as max_volume
-            FROM candles 
-            WHERE symbol = ? 
-            ORDER BY timestamp DESC 
-            LIMIT 24
+            FROM (
+                SELECT high, low, volume 
+                FROM candles 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 24
+            )
         `).get(sym) as any;
 
         return {
             symbol: sym,
             latestClose: latest ? Number(latest.close) : reasoning.currentPrice,
-            high24h: range24h ? Number(range24h.high_24h) : (latest ? Number(latest.high) : reasoning.currentPrice * 1.02),
-            low24h: range24h ? Number(range24h.low_24h) : (latest ? Number(latest.low) : reasoning.currentPrice * 0.98),
-            volume24h: latest ? Number(latest.volume) : 0,
+            high24h: (range24h && range24h.high_24h != null) ? Number(range24h.high_24h) : (latest ? Number(latest.high) : reasoning.currentPrice * 1.02),
+            low24h: (range24h && range24h.low_24h != null) ? Number(range24h.low_24h) : (latest ? Number(latest.low) : reasoning.currentPrice * 0.98),
+            volume24h: (range24h && range24h.volume_24h != null) ? Number(range24h.volume_24h) : (latest ? Number(latest.volume) : 0),
             lastUpdated: latest ? Number(latest.timestamp) : Date.now()
         };
     });

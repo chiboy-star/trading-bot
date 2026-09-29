@@ -248,6 +248,7 @@ export default function CandlestickChart({
                         <div className="flex items-center gap-1.5">
                             <span className="text-slate-500 font-sans text-[11px]">Symbol:</span>
                             <span className="font-bold text-white">{selectedSymbol}</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/60">USD/USDT</span>
                         </div>
                         <div className="flex items-center gap-1.5">
                             <span className="text-slate-500 font-sans text-[11px]">O:</span>

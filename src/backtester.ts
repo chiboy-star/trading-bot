@@ -175,7 +175,7 @@ export function runBacktest(
                 balance = 0;
                 inPosition = true;
                 entryTime = nextCandle.timestamp;
-                entryPriceRaw = nextCandle.open;
+                entryPriceRaw = executionPrice;
                 highestSinceEntry = nextCandle.open;
                 trailingStop = nextCandle.open - (atrMultiplier * currentAtr);
             }
@@ -213,7 +213,7 @@ export function runBacktest(
                     entryTime,
                     exitTime: nextCandle.timestamp,
                     entryPrice: entryPriceRaw,
-                    exitPrice: nextCandle.open,
+                    exitPrice: executionPrice,
                     durationMs: nextCandle.timestamp - entryTime,
                     pnl,
                     pnlPercent,
@@ -241,7 +241,7 @@ export function runBacktest(
             entryTime,
             exitTime: lastCandle.timestamp,
             entryPrice: entryPriceRaw,
-            exitPrice: lastCandle.close,
+            exitPrice: executionPrice,
             durationMs: lastCandle.timestamp - entryTime,
             pnl,
             pnlPercent,
