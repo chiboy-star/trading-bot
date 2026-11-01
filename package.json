@@ -9,10 +9,16 @@
     "runner:dry-run": "node dist/src/live_runner.js --dry-run",
     "runner:tradew": "node dist/src/tradew_runner.js",
     "screener": "node dist/src/screener.js",
+    "recorder": "node dist/src/recorder/index.js",
+    "recorder:dry-run": "node dist/src/recorder/index.js --dry-run",
+    "recorder:report": "node dist/src/recorder/index.js --report",
+    "recorder:summary": "node dist/src/recorder/index.js --report",
+    "recorder:soak": "node dist/scripts/soak_test.js",
     "test:alert": "node dist/scripts/test_alert.js",
     "dashboard:dev": "npm run dev --prefix dashboard",
     "dashboard:build": "npm run build --prefix dashboard",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -23,12 +29,15 @@
     "ccxt": "^4.5.84",
     "dotenv": "^18.0.4",
     "metaapi.cloud-sdk": "^29.3.3",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
     "technicalindicators": "^3.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.2",
     "ts-node": "^10.9.2",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
   }
 }

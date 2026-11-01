@@ -1,11 +1,12 @@
-import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import dotenv from 'dotenv';
 import ccxt from 'ccxt';
-import { EMA, RSI, ADX, ATR } from 'technicalindicators';
+import { db, updateHeartbeat, getSystemState, setSystemStatus, clearPendingCommand, logActivity, marketClosePositions, closeDb } from './db';
+import config from './config';
+import { createLogger } from './utils/logger';
+import { StrategyEngine, RiskManager, CandleData, ActivePositionState } from './strategy/core';
 
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const log = createLogger('tradew-runner');
 
 // ANSI Colors for terminal logging
 const C = {
@@ -20,101 +21,9 @@ const C = {
     BOLD: "\x1b[1m"
 };
 
-// Database setup - targets canonical root data/market_data.db
-function getCanonicalDbPath(): string {
-    const rootPath = path.resolve(process.cwd(), 'data/market_data.db');
-    if (fs.existsSync(rootPath)) return rootPath;
-    const parentPath = path.resolve(process.cwd(), '../data/market_data.db');
-    if (fs.existsSync(parentPath)) return parentPath;
-    return path.resolve(__dirname, '../../data/market_data.db');
-}
+export { db };
 
-export const db = new Database(getCanonicalDbPath());
-
-// Schema definition ensuring broker column and tradew_account exist
-db.exec(`
-    CREATE TABLE IF NOT EXISTS candles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        timeframe TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        open REAL NOT NULL,
-        high REAL NOT NULL,
-        low REAL NOT NULL,
-        close REAL NOT NULL,
-        volume REAL NOT NULL,
-        UNIQUE(symbol, timeframe, timestamp)
-    );
-
-    CREATE TABLE IF NOT EXISTS paper_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        type TEXT NOT NULL,
-        price REAL NOT NULL,
-        amount REAL NOT NULL,
-        fee REAL NOT NULL,
-        pnl REAL DEFAULT 0,
-        pnl_percent REAL DEFAULT 0,
-        timestamp INTEGER NOT NULL,
-        direction TEXT DEFAULT 'LONG',
-        execution_mode TEXT DEFAULT 'LIVE_FORWARD',
-        broker TEXT DEFAULT 'TRADE_W'
-    );
-
-    CREATE TABLE IF NOT EXISTS active_positions (
-        symbol TEXT PRIMARY KEY,
-        side TEXT DEFAULT 'LONG',
-        amount REAL NOT NULL,
-        entry_price REAL NOT NULL,
-        current_price REAL NOT NULL,
-        highest_price REAL NOT NULL,
-        lowest_price REAL DEFAULT 0,
-        trailing_stop REAL NOT NULL,
-        atr REAL NOT NULL,
-        pnl REAL DEFAULT 0,
-        pnl_percent REAL DEFAULT 0,
-        entry_time INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        broker TEXT DEFAULT 'TRADE_W'
-    );
-
-    CREATE TABLE IF NOT EXISTS tradew_account (
-        id INTEGER PRIMARY KEY,
-        balance REAL NOT NULL,
-        equity REAL NOT NULL,
-        free_margin REAL NOT NULL,
-        margin REAL DEFAULT 0,
-        margin_level REAL DEFAULT 0,
-        leverage INTEGER DEFAULT 100,
-        currency TEXT DEFAULT 'USD',
-        server TEXT DEFAULT 'TradeW-MT5Live',
-        platform TEXT DEFAULT 'MT5',
-        active_cfd_count INTEGER DEFAULT 0,
-        connected INTEGER DEFAULT 1,
-        updated_at INTEGER NOT NULL
-    );
-`);
-
-// Safe column migrations
-try {
-    const tradeCols = db.prepare("PRAGMA table_info(paper_trades)").all() as { name: string }[];
-    const tradeColNames = tradeCols.map(c => c.name);
-    if (!tradeColNames.includes('broker')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN broker TEXT DEFAULT 'BYBIT';");
-    }
-} catch (e) {}
-
-try {
-    const posCols = db.prepare("PRAGMA table_info(active_positions)").all() as { name: string }[];
-    const posColNames = posCols.map(c => c.name);
-    if (!posColNames.includes('broker')) {
-        db.exec("ALTER TABLE active_positions ADD COLUMN broker TEXT DEFAULT 'BYBIT';");
-    }
-} catch (e) {}
-
-// Prepared statements
+// Prepared statements with composite primary key (symbol, broker)
 const upsertCandleStmt = db.prepare(`
     INSERT INTO candles (symbol, timeframe, timestamp, open, high, low, close, volume)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -132,9 +41,9 @@ const insertTradeStmt = db.prepare(`
 `);
 
 const upsertActivePosStmt = db.prepare(`
-    INSERT INTO active_positions (symbol, side, amount, entry_price, current_price, highest_price, lowest_price, trailing_stop, atr, pnl, pnl_percent, entry_time, updated_at, broker)
+    INSERT INTO active_positions (symbol, broker, side, amount, entry_price, current_price, highest_price, lowest_price, trailing_stop, atr, pnl, pnl_percent, entry_time, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET
+    ON CONFLICT(symbol, broker) DO UPDATE SET
         side = excluded.side,
         amount = excluded.amount,
         entry_price = excluded.entry_price,
@@ -145,8 +54,7 @@ const upsertActivePosStmt = db.prepare(`
         atr = excluded.atr,
         pnl = excluded.pnl,
         pnl_percent = excluded.pnl_percent,
-        updated_at = excluded.updated_at,
-        broker = excluded.broker;
+        updated_at = excluded.updated_at;
 `);
 
 const deleteActivePosStmt = db.prepare(`
@@ -200,10 +108,6 @@ export interface MTCandle {
 
 /**
  * Trade W MetaTrader 4/5 Connection Bridge.
- * Interfaces with an MT4/MT5 terminal via:
- * 1. metaapi.cloud SDK (when TRADEW_METAAPI_TOKEN and TRADEW_ACCOUNT_ID are provided)
- * 2. Local ZeroMQ bridge EA (when TRADEW_ZMQ_URL is provided)
- * 3. High-fidelity terminal bridge simulator when credentials are unset.
  */
 export class TradeWMTBridge {
     private token: string | undefined;
@@ -223,149 +127,207 @@ export class TradeWMTBridge {
         marginLevel: 0.00,
         leverage: 100,
         currency: 'USD',
-        server: process.env.TRADEW_SERVER || 'TradeW-Live',
-        platform: (process.env.TRADEW_PLATFORM as 'MT4' | 'MT5') || 'MT5',
+        server: config.tradew.server || 'TradeW-Live',
+        platform: (config.tradew.platform as 'MT4' | 'MT5') || 'MT5',
         name: 'Trade W MT5 Client',
         connected: false
     };
 
     constructor() {
-        this.token = process.env.TRADEW_METAAPI_TOKEN || process.env.METAAPI_TOKEN;
-        this.accountId = process.env.TRADEW_ACCOUNT_ID || process.env.METAAPI_ACCOUNT_ID;
-        this.zmqUrl = process.env.TRADEW_ZMQ_URL;
+        this.token = config.tradew.metaApiToken;
+        this.accountId = config.tradew.accountId;
+        this.zmqUrl = config.tradew.zmqUrl;
     }
 
     public async initialize(): Promise<void> {
-        console.log(`\n${C.CYAN}${C.BOLD}═══════════════════════════════════════════════════════════════${C.RESET}`);
-        console.log(`${C.CYAN}${C.BOLD}  TRADE W METATRADER 4/5 (MT4/MT5) EXECUTION ENVIRONMENT${C.RESET}`);
-        console.log(`${C.CYAN}  Broker: Trade W | Server: ${this.accountState.server} | Platform: ${this.accountState.platform}${C.RESET}`);
-        console.log(`${C.CYAN}${C.BOLD}═══════════════════════════════════════════════════════════════${C.RESET}\n`);
+        log.info({ server: this.accountState.server, platform: this.accountState.platform }, 'Initializing TradeW MT4/MT5 Execution Environment');
 
         // Attempt 1: MetaApi Cloud SDK
         if (this.token && this.accountId) {
+            // SAFETY DIRECTIVE HARD BLOCK:
+            // Live MT5 execution requires BOTH explicit LIVE flag (config.app.isLive === true)
+            // AND operator's written approval (LIVE_EXECUTION_WRITTEN_APPROVAL="APPROVED_LIVE_EXECUTION_BY_OPERATOR").
+            const liveModeAllowed = config.app.isLive && process.env.LIVE_EXECUTION_WRITTEN_APPROVAL === 'APPROVED_LIVE_EXECUTION_BY_OPERATOR';
+            if (!liveModeAllowed) {
+                log.warn({
+                    executionMode: config.app.executionMode,
+                    isLive: config.app.isLive,
+                    hasWrittenApproval: process.env.LIVE_EXECUTION_WRITTEN_APPROVAL === 'APPROVED_LIVE_EXECUTION_BY_OPERATOR'
+                }, '⚠️ SAFETY HARD BLOCK: Real MT5 execution via MetaApi is LOCKED. EXECUTION_MODE is PAPER and/or LIVE_EXECUTION_WRITTEN_APPROVAL is missing. Forcing High-Fidelity Simulation mode.');
+                this.connectionMode = 'BRIDGE_SIMULATION';
+                this.accountState.connected = true;
+                return;
+            }
+
             try {
-                console.log(`${C.BLUE}[BRIDGE CONNECT]${C.RESET} Initializing metaapi.cloud SDK with Account ID: ${this.accountId}...`);
+                log.info({ accountId: this.accountId }, 'Connecting via metaapi.cloud SDK (LIVE MODE AUTHORIZED)...');
                 const MetaApiModule = await import('metaapi.cloud-sdk');
                 const MetaApi = (MetaApiModule as any).default || MetaApiModule;
                 this.metaApiInstance = new MetaApi(this.token);
+
                 this.mtAccount = await this.metaApiInstance.metatraderAccountApi.getAccount(this.accountId);
+                if (this.mtAccount.state !== 'DEPLOYED') {
+                    await this.mtAccount.deploy();
+                }
+
+                await this.mtAccount.waitConnected();
                 this.rpcConnection = this.mtAccount.getRPCConnection();
                 await this.rpcConnection.connect();
                 await this.rpcConnection.waitSynchronized();
 
-                const remoteInfo = await this.rpcConnection.getAccountInformation();
+                const terminalInfo = await this.rpcConnection.getAccountInformation();
                 this.accountState = {
-                    balance: remoteInfo.balance || 10000.00,
-                    equity: remoteInfo.equity || remoteInfo.balance || 10000.00,
-                    freeMargin: remoteInfo.freeMargin || remoteInfo.balance || 10000.00,
-                    margin: remoteInfo.margin || 0,
-                    marginLevel: remoteInfo.marginLevel || 0,
-                    leverage: remoteInfo.leverage || 100,
-                    currency: remoteInfo.currency || 'USD',
-                    server: remoteInfo.server || this.accountState.server,
-                    platform: remoteInfo.platform === 'mt4' ? 'MT4' : 'MT5',
-                    name: remoteInfo.name || 'Trade W MT5 Account',
+                    balance: terminalInfo.balance,
+                    equity: terminalInfo.equity,
+                    freeMargin: terminalInfo.freeMargin,
+                    margin: terminalInfo.margin,
+                    marginLevel: terminalInfo.marginLevel || 0,
+                    leverage: terminalInfo.leverage,
+                    currency: terminalInfo.currency,
+                    server: terminalInfo.server || this.accountState.server,
+                    platform: terminalInfo.platform?.toUpperCase() === 'MT4' ? 'MT4' : 'MT5',
+                    name: terminalInfo.name || 'TradeW MT5 Live Account',
                     connected: true
                 };
+
                 this.isConnected = true;
                 this.connectionMode = 'METAAPI';
-                console.log(`${C.GREEN}[BRIDGE CONNECTED]${C.RESET} MetaApi Cloud connected successfully to Trade W terminal!`);
+                log.info({ accountState: this.accountState }, 'MetaApi Cloud SDK connection established');
                 return;
             } catch (err: any) {
-                console.warn(`${C.YELLOW}[METAAPI WARNING]${C.RESET} MetaApi connection failed (${err?.message || err}). Falling back to local terminal bridge...`);
+                log.warn({ err: err?.message || err }, 'MetaApi Cloud SDK bridge connection failed; falling back to ZeroMQ / Simulation');
             }
         }
 
-        // Attempt 2: ZeroMQ Terminal Bridge (Local EA)
+        // Attempt 2: Local ZeroMQ Expert Advisor Bridge
         if (this.zmqUrl) {
-            console.log(`${C.BLUE}[BRIDGE CONNECT]${C.RESET} Configured ZeroMQ endpoint at ${this.zmqUrl}...`);
-            this.connectionMode = 'ZEROMQ';
-            this.isConnected = true;
-            this.accountState.connected = true;
-            console.log(`${C.GREEN}[BRIDGE CONNECTED]${C.RESET} Connected via ZeroMQ MT4/MT5 bridge EA!`);
-            return;
+            try {
+                log.info({ zmqUrl: this.zmqUrl }, 'Testing TradeW ZeroMQ EA Bridge...');
+                this.connectionMode = 'ZEROMQ';
+                this.accountState.connected = true;
+                log.info('ZeroMQ EA Bridge active on local MT5 terminal');
+                return;
+            } catch (err: any) {
+                log.warn({ err: err?.message || err }, 'ZeroMQ EA bridge failed; using Simulation');
+            }
         }
 
-        // Fallback / Scaffolded Terminal Bridge
+        // Fallback: Terminal Bridge Simulator
         this.connectionMode = 'BRIDGE_SIMULATION';
-        this.isConnected = true;
         this.accountState.connected = true;
-        console.log(`${C.YELLOW}[MT5 BRIDGE ACTIVE]${C.RESET} Running Trade W MT4/MT5 Bridge Scaffolding.`);
-        console.log(`${C.DIM}   • Set TRADEW_METAAPI_TOKEN & TRADEW_ACCOUNT_ID in .env for direct cloud synchronization.${C.RESET}`);
-        console.log(`${C.DIM}   • Set TRADEW_ZMQ_URL in .env for local MT4/MT5 Expert Advisor ZeroMQ bridge.${C.RESET}`);
+        log.info('Trade W MT4/MT5 High-Fidelity Terminal Simulator active with $10,000 USD margin balance');
     }
 
     public getAccountInfo(): MTAccountInfo {
         return { ...this.accountState };
     }
 
-    public updateAccountMargin(activePositionsMap: Map<string, Position>): void {
-        let totalRequiredMargin = 0;
-        let floatingPnl = 0;
+    public getConnectionMode(): string {
+        return this.connectionMode;
+    }
 
-        for (const pos of activePositionsMap.values()) {
-            // For CFD ETC/USDT: 1:100 leverage -> Margin = (amount * currentPrice) / leverage
-            const positionMargin = (pos.amount * pos.entryPrice) / this.accountState.leverage;
-            totalRequiredMargin += positionMargin;
+    public async executeOrder(
+        symbol: string,
+        action: 'BUY' | 'SELL',
+        lots: number,
+        price: number,
+        stopLoss: number,
+        takeProfit?: number
+    ): Promise<{ orderId: string; success: boolean; executionPrice: number }> {
+        const orderId = `MT5-${symbol.replace(/[^A-Za-z0-9]/g, '')}-${Date.now().toString().slice(-6)}`;
 
-            if (pos.side === 'LONG') {
-                floatingPnl += (pos.amount * (pos.currentPrice - pos.entryPrice));
-            } else {
-                floatingPnl += (pos.amount * (pos.entryPrice - pos.currentPrice));
+        // CRITICAL HARD BLOCK: Block real MetaApi order placement unless both conditions are met:
+        // 1. config.app.isLive === true (--live CLI argument AND EXECUTION_MODE=LIVE in .env)
+        // 2. LIVE_EXECUTION_WRITTEN_APPROVAL === "APPROVED_LIVE_EXECUTION_BY_OPERATOR"
+        const liveModeAllowed = config.app.isLive && process.env.LIVE_EXECUTION_WRITTEN_APPROVAL === 'APPROVED_LIVE_EXECUTION_BY_OPERATOR';
+
+        if (this.connectionMode === 'METAAPI' && this.rpcConnection) {
+            if (!liveModeAllowed) {
+                log.warn({
+                    orderId,
+                    symbol,
+                    action,
+                    lots,
+                    executionMode: config.app.executionMode,
+                    isLive: config.app.isLive
+                }, '⚠️ SAFETY HARD BLOCK: Attempted MetaApi createMarketOrder but EXECUTION_MODE is PAPER or LIVE_EXECUTION_WRITTEN_APPROVAL is missing. Executing SIMULATED fill only.');
+                return {
+                    orderId,
+                    success: true,
+                    executionPrice: price
+                };
+            }
+
+            try {
+                const mtSymbol = config.tradew.mt5Symbol || symbol.replace('/', '');
+                const tradeAction = action === 'BUY' ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL';
+                const result = await this.rpcConnection.createMarketOrder(
+                    mtSymbol,
+                    tradeAction,
+                    lots,
+                    stopLoss,
+                    takeProfit || 0
+                );
+                return {
+                    orderId: result.orderId?.toString() || orderId,
+                    success: true,
+                    executionPrice: result.price || price
+                };
+            } catch (err: any) {
+                log.error({ err }, 'MetaApi execution error');
             }
         }
 
-        this.accountState.margin = totalRequiredMargin;
-        this.accountState.equity = this.accountState.balance + floatingPnl;
-        this.accountState.freeMargin = Math.max(0, this.accountState.equity - this.accountState.margin);
-        this.accountState.marginLevel = totalRequiredMargin > 0 ? (this.accountState.equity / totalRequiredMargin) * 100 : 0;
+        return {
+            orderId,
+            success: true,
+            executionPrice: price
+        };
+    }
+
+    public updateAccountMargin(positionsMap: Map<string, Position>): void {
+        let totalMargin = 0;
+        let totalUnrealizedPnl = 0;
+
+        for (const pos of positionsMap.values()) {
+            const marginRequired = (pos.amount * pos.entryPrice) / this.accountState.leverage;
+            totalMargin += marginRequired;
+
+            const pnlCalc = StrategyEngine.calculatePnL(
+                pos.side,
+                pos.amount,
+                pos.entryPrice,
+                pos.currentPrice,
+                { slippage: CFD_SPREAD_SLIPPAGE, takerFee: CFD_COMMISSION_FEE }
+            );
+            totalUnrealizedPnl += pnlCalc.unrealizedPnl;
+        }
+
+        this.accountState.margin = Number(totalMargin.toFixed(2));
+        this.accountState.equity = Number((this.accountState.balance + totalUnrealizedPnl).toFixed(2));
+        this.accountState.freeMargin = Number(Math.max(0, this.accountState.equity - totalMargin).toFixed(2));
+        this.accountState.marginLevel = totalMargin > 0
+            ? Number(((this.accountState.equity / totalMargin) * 100).toFixed(2))
+            : 0;
     }
 
     public applyRealizedPnl(pnl: number): void {
-        this.accountState.balance += pnl;
-        this.accountState.equity += pnl;
-        this.accountState.freeMargin = Math.max(0, this.accountState.equity - this.accountState.margin);
-    }
-
-    /**
-     * Executes order on MT4/MT5 through MetaApi if connected, or through the bridge engine.
-     */
-    public async executeOrder(
-        symbol: string,
-        side: 'BUY' | 'SELL',
-        volume: number,
-        price: number,
-        stopLoss?: number
-    ): Promise<{ orderId: string; executionPrice: number }> {
-        const orderId = `MT5-TW-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-
-        if (this.connectionMode === 'METAAPI' && this.rpcConnection) {
-            try {
-                const mtSymbol = symbol.replace('/', '');
-                if (side === 'BUY') {
-                    await this.rpcConnection.createMarketBuyOrder(mtSymbol, volume, stopLoss, undefined);
-                } else {
-                    await this.rpcConnection.createMarketSellOrder(mtSymbol, volume, stopLoss, undefined);
-                }
-            } catch (err: any) {
-                console.error(`[METAAPI ORDER ERROR] Failed to place ${side} order:`, err);
-            }
-        }
-
-        return { orderId, executionPrice: price };
+        this.accountState.balance = Number((this.accountState.balance + pnl).toFixed(2));
+        this.accountState.equity = Number((this.accountState.equity + pnl).toFixed(2));
+        this.accountState.freeMargin = Number((this.accountState.freeMargin + pnl).toFixed(2));
     }
 }
 
 // -------------------------------------------------------------
-// Strategy & Risk Configuration for Trade W ETC/USDT
+// Singleton Exchange Client & Configuration
 // -------------------------------------------------------------
 
-export const TARGET_SYMBOL = 'ETC/USDT';
-export const TIMEFRAME = '1h';
-export const ATR_MULTIPLIER = 1.5;
-export const MAX_RISK_PCT = 0.02; // Risk strictly 2% of portfolio per position
-export const CFD_SPREAD_SLIPPAGE = 0.0005; // 0.05%
-export const CFD_COMMISSION_FEE = 0.0006;  // 0.06%
+export const TARGET_SYMBOL = config.tradew.targetSymbol || 'ETC/USDT';
+export const TIMEFRAME = config.exchange.timeframe || '1h';
+export const CFD_SPREAD_SLIPPAGE = config.exchange.slippage;
+export const CFD_COMMISSION_FEE = config.exchange.takerFee;
+export const ATR_MULTIPLIER = config.strategy.atrMultiplier;
+export const MAX_RISK_PCT = config.risk.maxRiskPct;
 
 export interface Position {
     symbol: string;
@@ -380,20 +342,32 @@ export interface Position {
     atr: number;
 }
 
-const bridge = new TradeWMTBridge();
-const positions: Map<string, Position> = new Map();
+export const bridge = new TradeWMTBridge();
+export const positions = new Map<string, Position>();
 
-function generateOrderId(): string {
-    return 'TW-' + Math.random().toString(36).substring(2, 9).toUpperCase();
+// Singleton Bybit Exchange client for live candle feeds
+let bybitExchangeInstance: any = null;
+function getBybitExchange(): any {
+    if (!bybitExchangeInstance) {
+        bybitExchangeInstance = new ccxt.bybit({
+            hostname: config.exchange.bybitHostname,
+            enableRateLimit: true,
+            timeout: 30000,
+            options: { defaultType: 'future' },
+        });
+    }
+    return bybitExchangeInstance;
 }
 
-/**
- * Logs a Trade W trade execution to SQLite tagged with broker = 'TRADE_W'.
- */
+function generateTradeOrderId(): string {
+    const rand = Math.floor(1000 + Math.random() * 9000);
+    return `TW-${Date.now().toString().slice(-6)}-${rand}`;
+}
+
 export function logTradeWTrade(
     symbol: string,
     side: 'BUY' | 'SELL',
-    type: 'ENTRY' | 'TRAILING_STOP' | 'EMA_CROSS' | 'MANUAL_CLOSE',
+    type: 'ENTRY' | 'TRAILING_STOP' | 'EMA_CROSS' | 'TAKE_PROFIT' | 'MANUAL_CLOSE',
     price: number,
     amount: number,
     fee: number,
@@ -403,19 +377,11 @@ export function logTradeWTrade(
     direction: 'LONG' | 'SHORT' = 'LONG',
     executionMode: 'LIVE_FORWARD' | 'BACKTEST_MOCK' = 'LIVE_FORWARD'
 ) {
-    const orderId = generateOrderId();
+    const orderId = generateTradeOrderId();
     insertTradeStmt.run(orderId, symbol, side, type, price, amount, fee, pnl, pnlPercent, timestamp, direction, executionMode, 'TRADE_W');
-
-    const color = direction === 'LONG' ? C.GREEN : C.MAGENTA;
-    const dirEmoji = direction === 'LONG' ? '🟢' : '🔴';
-    const actionVerb = side === 'BUY' ? 'Bought' : 'Sold';
-    const pnlStr = pnl !== 0 ? ` | Result: ${pnl > 0 ? '✅ Profit' : '❌ Loss'} $${Math.abs(pnl).toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)` : '';
-    console.log(`${color}${dirEmoji} [TRADE W ${executionMode}] ${actionVerb} ${symbol}${C.RESET} @ $${price.toFixed(3)} | Amount: ${amount.toFixed(2)} | Fee: $${fee.toFixed(2)}${pnlStr}`);
+    log.info({ orderId, symbol, direction, side, type, price, amount, fee, pnl, pnlPercent }, `[TRADE W MT5] Logged trade on ${symbol}`);
 }
 
-/**
- * Persists MT4/MT5 account state into SQLite tradew_account table for the dashboard.
- */
 function syncAccountToDb(): void {
     const acc = bridge.getAccountInfo();
     const activeCfdCount = Array.from(positions.values()).length;
@@ -453,20 +419,20 @@ function syncAccountToDb(): void {
                 atr: p.atr
             });
         }
-    } catch (e) {}
+    } catch (e) {
+        log.warn({ e }, 'Failed restoring saved Trade W active positions');
+    }
 })();
 
 /**
- * Fetches recent 1-hour candles for ETC/USDT.
- * Uses public CCXT linear feed to guarantee reliable live price action.
+ * Fetches recent 1-hour candles for ETC/USDT using singleton exchange.
  */
 async function fetchEtcCandles(limit: number = 150): Promise<MTCandle[]> {
     try {
-        const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
-        const exchange = new ccxt.bybit({ hostname: bybitHostname, enableRateLimit: true });
+        const exchange = getBybitExchange();
         const ohlcv = await exchange.fetchOHLCV(TARGET_SYMBOL, TIMEFRAME, undefined, limit);
         if (ohlcv && ohlcv.length > 0) {
-            return ohlcv.map(c => ({
+            return ohlcv.map((c: any) => ({
                 timestamp: c[0] as number,
                 open: c[1] as number,
                 high: c[2] as number,
@@ -476,7 +442,7 @@ async function fetchEtcCandles(limit: number = 150): Promise<MTCandle[]> {
             }));
         }
     } catch (err: any) {
-        // Fallback: check SQLite database for cached candles
+        log.warn({ err: err?.message || err }, 'CCXT fetch error; querying local SQLite cache');
         const rows = db.prepare(`
             SELECT timestamp, open, high, low, close, volume FROM candles
             WHERE symbol = ? AND timeframe = ?
@@ -484,7 +450,7 @@ async function fetchEtcCandles(limit: number = 150): Promise<MTCandle[]> {
         `).all(TARGET_SYMBOL, TIMEFRAME, limit) as any[];
 
         if (rows && rows.length > 0) {
-            return rows.reverse().map(r => ({
+            return rows.reverse().map((r: any) => ({
                 timestamp: r.timestamp,
                 open: r.open,
                 high: r.high,
@@ -498,9 +464,9 @@ async function fetchEtcCandles(limit: number = 150): Promise<MTCandle[]> {
 }
 
 /**
- * Evaluates 20/50 EMA, RSI(14), ADX(14) > 25 strategy and manages 1.5x ATR trailing stop.
+ * Evaluates strategy tick using StrategyEngine & RiskManager.
  */
-export async function evaluateStrategyTick(candles: MTCandle[], isClosed: boolean): Promise<void> {
+export async function evaluateStrategyTick(candles: MTCandle[], isClosed: boolean, isPaused: boolean = false): Promise<void> {
     if (candles.length < 50) return;
 
     // Persist candles to SQLite
@@ -511,320 +477,193 @@ export async function evaluateStrategyTick(candles: MTCandle[], isClosed: boolea
     });
     insertMany(candles);
 
-    const closes = candles.map(c => c.close);
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
+    const candleData = candles.map(c => ({
+        timestamp: c.timestamp,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume
+    }));
 
-    const ema20Arr = EMA.calculate({ period: 20, values: closes });
-    const ema50Arr = EMA.calculate({ period: 50, values: closes });
-    const rsi14Arr = RSI.calculate({ period: 14, values: closes });
-    const adx14Arr = ADX.calculate({ period: 14, high: highs, low: lows, close: closes });
-    const atr14Arr = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
+    const latestCandle = candleData[candleData.length - 1];
+    const snapshot = StrategyEngine.getLatestSnapshot(candleData);
+    if (!snapshot) return;
 
-    const currentEma20 = ema20Arr[ema20Arr.length - 1];
-    const previousEma20 = ema20Arr[ema20Arr.length - 2];
-    const currentEma50 = ema50Arr[ema50Arr.length - 1];
-    const previousEma50 = ema50Arr[ema50Arr.length - 2];
-    const currentRsi = rsi14Arr[rsi14Arr.length - 1];
-    const currentAdx = adx14Arr[adx14Arr.length - 1]?.adx ?? 0;
-    const currentAtr = atr14Arr[atr14Arr.length - 1] ?? 0;
-
-    const latestCandle = candles[candles.length - 1];
-    const { high, low, close, timestamp } = latestCandle;
-
-    // Update active position tracking
+    // 1. POSITION MANAGEMENT & DYNAMIC TRAILING STOP
     if (positions.has(TARGET_SYMBOL)) {
         const pos = positions.get(TARGET_SYMBOL)!;
-        pos.currentPrice = close;
-        const effectiveAtr = currentAtr > 0 ? currentAtr : pos.atr;
+        pos.currentPrice = latestCandle.close;
 
-        if (pos.side === 'LONG') {
-            // Trailing Stop ratchets UP on new highs
-            if (high > pos.highestPrice) {
-                pos.highestPrice = high;
-                const proposedStop = pos.highestPrice - (ATR_MULTIPLIER * effectiveAtr);
-                if (proposedStop > pos.trailingStop) {
-                    pos.trailingStop = proposedStop;
-                    console.log(`${C.CYAN}🔒 [TRADE W MT5] Safety stop raised:${C.RESET} ${TARGET_SYMBOL} hit new high ($${pos.highestPrice.toFixed(3)}), stop at $${pos.trailingStop.toFixed(3)}`);
-                }
-            }
+        const exitEval = StrategyEngine.evaluateExit(
+            {
+                symbol: pos.symbol,
+                side: pos.side,
+                amount: pos.amount,
+                entryPrice: pos.entryPrice,
+                currentPrice: pos.currentPrice,
+                highestPrice: pos.highestPrice,
+                lowestPrice: pos.lowestPrice,
+                trailingStop: pos.trailingStop,
+                atr: pos.atr,
+                entryTime: pos.entryTime,
+            },
+            latestCandle,
+            snapshot,
+            isClosed,
+            { atrMultiplier: ATR_MULTIPLIER, slippage: CFD_SPREAD_SLIPPAGE }
+        );
 
-            const unrealizedPnl = (pos.amount * close * (1 - CFD_SPREAD_SLIPPAGE) * (1 - CFD_COMMISSION_FEE)) - (pos.amount * pos.entryPrice);
-            const unrealizedPnlPct = (unrealizedPnl / (pos.amount * pos.entryPrice)) * 100;
+        pos.trailingStop = exitEval.newTrailingStop;
+        pos.highestPrice = exitEval.newHighestPrice;
+        pos.lowestPrice = exitEval.newLowestPrice;
 
-            upsertActivePosStmt.run(
-                pos.symbol,
+        const pnlCalc = StrategyEngine.calculatePnL(
+            pos.side,
+            pos.amount,
+            pos.entryPrice,
+            latestCandle.close,
+            { slippage: CFD_SPREAD_SLIPPAGE, takerFee: CFD_COMMISSION_FEE }
+        );
+
+        upsertActivePosStmt.run(
+            pos.symbol,
+            'TRADE_W',
+            pos.side,
+            pos.amount,
+            pos.entryPrice,
+            latestCandle.close,
+            pos.highestPrice,
+            pos.lowestPrice,
+            pos.trailingStop,
+            pos.atr,
+            pnlCalc.unrealizedPnl,
+            pnlCalc.unrealizedPnlPercent,
+            pos.entryTime,
+            latestCandle.timestamp
+        );
+
+        if (exitEval.shouldExit && exitEval.reason) {
+            const executionPrice = exitEval.executionPrice;
+            const realizedCalc = StrategyEngine.calculatePnL(
                 pos.side,
                 pos.amount,
                 pos.entryPrice,
-                close,
-                pos.highestPrice,
-                pos.lowestPrice,
-                pos.trailingStop,
-                pos.atr,
-                unrealizedPnl,
-                unrealizedPnlPct,
-                pos.entryTime,
-                timestamp,
-                'TRADE_W'
+                executionPrice,
+                { slippage: CFD_SPREAD_SLIPPAGE, takerFee: CFD_COMMISSION_FEE }
             );
 
-            // Check if Long Trailing Stop breached
-            if (low <= pos.trailingStop) {
-                const executionPrice = pos.trailingStop * (1 - CFD_SPREAD_SLIPPAGE);
-                const grossValue = pos.amount * executionPrice;
-                const fee = grossValue * CFD_COMMISSION_FEE;
-                const netValue = grossValue - fee;
-                const pnl = netValue - (pos.amount * pos.entryPrice);
-                const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
+            log.info(
+                { symbol: TARGET_SYMBOL, reason: exitEval.reason, pnl: realizedCalc.netRealizedPnl },
+                `[TRADE W MT5] Position exited: ${exitEval.details}`
+            );
 
-                console.log(`${C.YELLOW}⚡ [TRADE W MT5] Long Trailing Stop Triggered:${C.RESET} Price dropped below $${pos.trailingStop.toFixed(3)} — Closing CFD`);
-                bridge.applyRealizedPnl(pnl);
-                logTradeWTrade(TARGET_SYMBOL, 'SELL', 'TRAILING_STOP', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
-
-                positions.delete(TARGET_SYMBOL);
-                deleteActivePosStmt.run(TARGET_SYMBOL);
-                bridge.updateAccountMargin(positions);
-                syncAccountToDb();
-                return;
-            }
-
-            // Check Long Exit on closed candle (20 EMA crosses below 50 EMA)
-            if (isClosed) {
-                const crossedBelow = previousEma20 >= previousEma50 && currentEma20 < currentEma50;
-                if (crossedBelow) {
-                    console.log(`${C.YELLOW}📉 [TRADE W MT5] EMA Reverse Cross:${C.RESET} 20 EMA crossed below 50 EMA — Exiting Long CFD`);
-                    const executionPrice = close * (1 - CFD_SPREAD_SLIPPAGE);
-                    const grossValue = pos.amount * executionPrice;
-                    const fee = grossValue * CFD_COMMISSION_FEE;
-                    const netValue = grossValue - fee;
-                    const pnl = netValue - (pos.amount * pos.entryPrice);
-                    const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                    bridge.applyRealizedPnl(pnl);
-                    logTradeWTrade(TARGET_SYMBOL, 'SELL', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
-
-                    positions.delete(TARGET_SYMBOL);
-                    deleteActivePosStmt.run(TARGET_SYMBOL);
-                    bridge.updateAccountMargin(positions);
-                    syncAccountToDb();
-                    return;
-                }
-            }
-        } else if (pos.side === 'SHORT') {
-            // Trailing Stop ratchets DOWN on new lows
-            if (low < pos.lowestPrice) {
-                pos.lowestPrice = low;
-                const proposedStop = pos.lowestPrice + (ATR_MULTIPLIER * effectiveAtr);
-                if (proposedStop < pos.trailingStop) {
-                    pos.trailingStop = proposedStop;
-                    console.log(`${C.CYAN}🔒 [TRADE W MT5] Safety stop lowered:${C.RESET} ${TARGET_SYMBOL} hit new low ($${pos.lowestPrice.toFixed(3)}), stop at $${pos.trailingStop.toFixed(3)}`);
-                }
-            }
-
-            const coverCost = pos.amount * close * (1 + CFD_SPREAD_SLIPPAGE) * (1 + CFD_COMMISSION_FEE);
-            const unrealizedPnl = (pos.amount * pos.entryPrice) - coverCost;
-            const unrealizedPnlPct = (unrealizedPnl / (pos.amount * pos.entryPrice)) * 100;
-
-            upsertActivePosStmt.run(
-                pos.symbol,
-                pos.side,
+            bridge.applyRealizedPnl(realizedCalc.netRealizedPnl);
+            logTradeWTrade(
+                TARGET_SYMBOL,
+                pos.side === 'LONG' ? 'SELL' : 'BUY',
+                exitEval.reason,
+                executionPrice,
                 pos.amount,
-                pos.entryPrice,
-                close,
-                pos.highestPrice,
-                pos.lowestPrice,
-                pos.trailingStop,
-                pos.atr,
-                unrealizedPnl,
-                unrealizedPnlPct,
-                pos.entryTime,
-                timestamp,
-                'TRADE_W'
+                realizedCalc.fee,
+                realizedCalc.netRealizedPnl,
+                realizedCalc.netRealizedPnlPercent,
+                latestCandle.timestamp,
+                pos.side,
+                'LIVE_FORWARD'
             );
 
-            // Check if Short Trailing Stop breached
-            if (high >= pos.trailingStop) {
-                const executionPrice = pos.trailingStop * (1 + CFD_SPREAD_SLIPPAGE);
-                const grossCost = pos.amount * executionPrice;
-                const fee = grossCost * CFD_COMMISSION_FEE;
-                const pnl = (pos.amount * pos.entryPrice) - grossCost - fee;
-                const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                console.log(`${C.YELLOW}⚡ [TRADE W MT5] Short Trailing Stop Triggered:${C.RESET} Price rose above $${pos.trailingStop.toFixed(3)} — Closing CFD`);
-                bridge.applyRealizedPnl(pnl);
-                logTradeWTrade(TARGET_SYMBOL, 'BUY', 'TRAILING_STOP', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'SHORT', 'LIVE_FORWARD');
-
-                positions.delete(TARGET_SYMBOL);
-                deleteActivePosStmt.run(TARGET_SYMBOL);
-                bridge.updateAccountMargin(positions);
-                syncAccountToDb();
-                return;
-            }
-
-            // Check Short Exit on closed candle (20 EMA crosses above 50 EMA)
-            if (isClosed) {
-                const crossedAbove = previousEma20 <= previousEma50 && currentEma20 > currentEma50;
-                if (crossedAbove) {
-                    console.log(`${C.YELLOW}📈 [TRADE W MT5] EMA Reverse Cross:${C.RESET} 20 EMA crossed above 50 EMA — Exiting Short CFD`);
-                    const executionPrice = close * (1 + CFD_SPREAD_SLIPPAGE);
-                    const grossCost = pos.amount * executionPrice;
-                    const fee = grossCost * CFD_COMMISSION_FEE;
-                    const pnl = (pos.amount * pos.entryPrice) - grossCost - fee;
-                    const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                    bridge.applyRealizedPnl(pnl);
-                    logTradeWTrade(TARGET_SYMBOL, 'BUY', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'SHORT', 'LIVE_FORWARD');
-
-                    positions.delete(TARGET_SYMBOL);
-                    deleteActivePosStmt.run(TARGET_SYMBOL);
-                    bridge.updateAccountMargin(positions);
-                    syncAccountToDb();
-                    return;
-                }
-            }
+            positions.delete(TARGET_SYMBOL);
+            deleteActivePosStmt.run(TARGET_SYMBOL);
+            bridge.updateAccountMargin(positions);
+            syncAccountToDb();
+            return;
         }
     }
 
-    // -------------------------------------------------------------
-    // Entry Conditions Evaluation (Evaluated on Closed 1h Candles)
-    // -------------------------------------------------------------
-    const adxPassed = currentAdx > 25;
-    const longRsiPassed = currentRsi >= 40 && currentRsi <= 65;
-    const shortRsiPassed = currentRsi >= 35 && currentRsi <= 60;
-    const longEmaCross = previousEma20 <= previousEma50 && currentEma20 > currentEma50;
-    const shortEmaCross = previousEma20 >= previousEma50 && currentEma20 < currentEma50;
+    // 2. ENTRY SIGNAL EVALUATION (when NOT paused)
+    if (!positions.has(TARGET_SYMBOL) && !isPaused) {
+        const signalEval = StrategyEngine.evaluateEntry(candleData, undefined, { isClosed, allowShorts: true });
+        const acc = bridge.getAccountInfo();
 
-    const acc = bridge.getAccountInfo();
+        if (signalEval.isEntry && signalEval.direction) {
+            const side = signalEval.direction;
+            const executionPrice = side === 'LONG'
+                ? latestCandle.close * (1 + CFD_SPREAD_SLIPPAGE)
+                : latestCandle.close * (1 - CFD_SPREAD_SLIPPAGE);
 
-    // Print diagnostic scan
-    const trendText = adxPassed ? `${C.GREEN}TRENDING (ADX ${currentAdx.toFixed(1)})${C.RESET}` : `${C.DIM}SIDEWAYS (ADX ${currentAdx.toFixed(1)})${C.RESET}`;
-    console.log(
-        `${C.CYAN}[TRADE W MT5]${C.RESET} ${TARGET_SYMBOL} $${close.toFixed(3)} | ${trendText} | ` +
-        `RSI: ${currentRsi.toFixed(1)} | 20 EMA: $${currentEma20.toFixed(3)} | 50 EMA: $${currentEma50.toFixed(3)} | ` +
-        `Free Margin: $${acc.freeMargin.toFixed(2)}`
-    );
+            const stopDistance = ATR_MULTIPLIER * snapshot.currentAtr;
+            const initialTrailingStop = side === 'LONG'
+                ? executionPrice - stopDistance
+                : executionPrice + stopDistance;
 
-    if (!positions.has(TARGET_SYMBOL) && isClosed) {
-        // A. LONG ENTRY: 20 EMA > 50 EMA AND RSI 40-65 AND ADX > 25
-        if (longEmaCross && longRsiPassed && adxPassed) {
-            console.log(`\n${C.GREEN}${C.BOLD}🟢 [TRADE W MT5] BUY SIGNAL TRIGGERED FOR ${TARGET_SYMBOL}${C.RESET}`);
-            console.log(`   ✅ ADX > 25 (${currentAdx.toFixed(1)})`);
-            console.log(`   ✅ RSI in 40-65 range (${currentRsi.toFixed(1)})`);
-            console.log(`   ✅ Bullish Golden Cross (20 EMA > 50 EMA)`);
+            const sizing = RiskManager.calculatePositionSize({
+                capital: acc.freeMargin,
+                executionPrice,
+                stopDistance,
+                takerFee: CFD_COMMISSION_FEE,
+                maxRiskPct: MAX_RISK_PCT,
+            });
 
-            const executionPrice = close * (1 + CFD_SPREAD_SLIPPAGE);
-            const stopDistance = ATR_MULTIPLIER * currentAtr;
-            const initialTrailingStop = executionPrice - stopDistance;
-
-            const riskAmount = acc.freeMargin * MAX_RISK_PCT;
-            const maxPositionUnits = stopDistance > 0 ? riskAmount / stopDistance : 0;
-            const positionSize = Math.max(1, Math.round(maxPositionUnits * 10) / 10); // Standardized contract units
-
+            const positionSize = Math.max(1, Math.round(sizing.positionSize * 10) / 10);
             const marginRequired = (positionSize * executionPrice) / acc.leverage;
+
             if (marginRequired > acc.freeMargin) {
-                console.log(`${C.RED}⚠️ [TRADE W MT5] Cannot open Long CFD — insufficient free margin ($${acc.freeMargin.toFixed(2)} free, $${marginRequired.toFixed(2)} required)${C.RESET}`);
+                log.warn({ marginRequired, freeMargin: acc.freeMargin }, '[TRADE W MT5] Cannot open CFD — insufficient free margin');
                 return;
             }
 
             const fee = positionSize * executionPrice * CFD_COMMISSION_FEE;
-            await bridge.executeOrder(TARGET_SYMBOL, 'BUY', positionSize, executionPrice, initialTrailingStop);
+            await bridge.executeOrder(TARGET_SYMBOL, side === 'LONG' ? 'BUY' : 'SELL', positionSize, executionPrice, initialTrailingStop);
 
             const newPos: Position = {
                 symbol: TARGET_SYMBOL,
-                side: 'LONG',
+                side,
                 amount: positionSize,
                 entryPrice: executionPrice,
                 currentPrice: executionPrice,
                 highestPrice: executionPrice,
                 lowestPrice: executionPrice,
                 trailingStop: initialTrailingStop,
-                entryTime: timestamp,
-                atr: currentAtr
+                entryTime: latestCandle.timestamp,
+                atr: snapshot.currentAtr
             };
             positions.set(TARGET_SYMBOL, newPos);
 
-            logTradeWTrade(TARGET_SYMBOL, 'BUY', 'ENTRY', executionPrice, positionSize, fee, 0, 0, timestamp, 'LONG', 'LIVE_FORWARD');
+            logTradeWTrade(
+                TARGET_SYMBOL,
+                side === 'LONG' ? 'BUY' : 'SELL',
+                'ENTRY',
+                executionPrice,
+                positionSize,
+                fee,
+                0,
+                0,
+                latestCandle.timestamp,
+                side,
+                'LIVE_FORWARD'
+            );
+
             upsertActivePosStmt.run(
                 TARGET_SYMBOL,
-                'LONG',
+                'TRADE_W',
+                side,
                 positionSize,
                 executionPrice,
                 executionPrice,
                 executionPrice,
                 executionPrice,
                 initialTrailingStop,
-                currentAtr,
+                snapshot.currentAtr,
                 0,
                 0,
-                timestamp,
-                timestamp,
-                'TRADE_W'
+                latestCandle.timestamp,
+                latestCandle.timestamp
             );
 
             bridge.updateAccountMargin(positions);
             syncAccountToDb();
-            console.log(`${C.BLUE}   📊 Position open:${C.RESET} Units: ${positionSize} | Margin: $${marginRequired.toFixed(2)} | Trailing Stop: $${initialTrailingStop.toFixed(3)}\n`);
-        }
-        // B. SHORT ENTRY: 20 EMA < 50 EMA AND RSI 35-60 AND ADX > 25
-        else if (shortEmaCross && shortRsiPassed && adxPassed) {
-            console.log(`\n${C.MAGENTA}${C.BOLD}🔴 [TRADE W MT5] SHORT SIGNAL TRIGGERED FOR ${TARGET_SYMBOL}${C.RESET}`);
-            console.log(`   ✅ ADX > 25 (${currentAdx.toFixed(1)})`);
-            console.log(`   ✅ RSI in 35-60 range (${currentRsi.toFixed(1)})`);
-            console.log(`   ✅ Bearish Death Cross (20 EMA < 50 EMA)`);
-
-            const executionPrice = close * (1 - CFD_SPREAD_SLIPPAGE);
-            const stopDistance = ATR_MULTIPLIER * currentAtr;
-            const initialTrailingStop = executionPrice + stopDistance;
-
-            const riskAmount = acc.freeMargin * MAX_RISK_PCT;
-            const maxPositionUnits = stopDistance > 0 ? riskAmount / stopDistance : 0;
-            const positionSize = Math.max(1, Math.round(maxPositionUnits * 10) / 10);
-
-            const marginRequired = (positionSize * executionPrice) / acc.leverage;
-            if (marginRequired > acc.freeMargin) {
-                console.log(`${C.RED}⚠️ [TRADE W MT5] Cannot open Short CFD — insufficient free margin ($${acc.freeMargin.toFixed(2)} free, $${marginRequired.toFixed(2)} required)${C.RESET}`);
-                return;
-            }
-
-            const fee = positionSize * executionPrice * CFD_COMMISSION_FEE;
-            await bridge.executeOrder(TARGET_SYMBOL, 'SELL', positionSize, executionPrice, initialTrailingStop);
-
-            const newPos: Position = {
-                symbol: TARGET_SYMBOL,
-                side: 'SHORT',
-                amount: positionSize,
-                entryPrice: executionPrice,
-                currentPrice: executionPrice,
-                highestPrice: executionPrice,
-                lowestPrice: executionPrice,
-                trailingStop: initialTrailingStop,
-                entryTime: timestamp,
-                atr: currentAtr
-            };
-            positions.set(TARGET_SYMBOL, newPos);
-
-            logTradeWTrade(TARGET_SYMBOL, 'SELL', 'ENTRY', executionPrice, positionSize, fee, 0, 0, timestamp, 'SHORT', 'LIVE_FORWARD');
-            upsertActivePosStmt.run(
-                TARGET_SYMBOL,
-                'SHORT',
-                positionSize,
-                executionPrice,
-                executionPrice,
-                executionPrice,
-                executionPrice,
-                initialTrailingStop,
-                currentAtr,
-                0,
-                0,
-                timestamp,
-                timestamp,
-                'TRADE_W'
-            );
-
-            bridge.updateAccountMargin(positions);
-            syncAccountToDb();
-            console.log(`${C.BLUE}   📊 Position open:${C.RESET} Units: ${positionSize} | Margin: $${marginRequired.toFixed(2)} | Trailing Stop: $${initialTrailingStop.toFixed(3)}\n`);
+            log.info({ side, positionSize, executionPrice, initialTrailingStop }, '[TRADE W MT5] Position opened successfully');
         }
     }
 
@@ -832,37 +671,96 @@ export async function evaluateStrategyTick(candles: MTCandle[], isClosed: boolea
     syncAccountToDb();
 }
 
-/**
- * Main polling runner loop for Trade W broker.
- */
-export async function startTradeWRunner() {
+// -------------------------------------------------------------
+// Main Polling Runner Loop & Lifecycle Management
+// -------------------------------------------------------------
+
+let isRunning = true;
+let pollTimer: NodeJS.Timeout | null = null;
+
+export function stopTradeWRunner(): void {
+    if (!isRunning) return;
+    isRunning = false;
+    log.info('Received shutdown signal (SIGINT/SIGTERM). Stopping TradeW polling loop gracefully...');
+    if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+    }
+    try {
+        bridge.updateAccountMargin(positions);
+        syncAccountToDb();
+        setSystemStatus('PAUSED', null, 'TradeW runner stopped gracefully');
+        closeDb();
+    } catch (e) {
+        log.error({ e }, 'Error during TradeW runner shutdown');
+    }
+}
+
+process.once('SIGINT', () => {
+    stopTradeWRunner();
+    process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+    stopTradeWRunner();
+    process.exit(0);
+});
+
+export async function startTradeWRunner(): Promise<void> {
     await bridge.initialize();
     syncAccountToDb();
+    setSystemStatus('RUNNING', null, 'TradeW live runner started');
 
-    console.log(`${C.GREEN}[POLLING INITIATED]${C.RESET} Watching 1-hour candles for ${TARGET_SYMBOL} on Trade W MT4/MT5...`);
+    log.info({ symbol: TARGET_SYMBOL }, `TradeW polling initiated. Watching 1h candles for ${TARGET_SYMBOL}...`);
 
     const pollIntervalMs = 15000; // Poll every 15 seconds
 
     const runCycle = async () => {
+        if (!isRunning) return;
         try {
+            // Heartbeat & Operator Control Polling
+            updateHeartbeat();
+            const sysState = getSystemState();
+
+            if (sysState.pending_command === 'PAUSE') {
+                log.info('Executing PAUSE operator command');
+                setSystemStatus('PAUSED', null, 'Operator requested pause via dashboard');
+                clearPendingCommand();
+            } else if (sysState.pending_command === 'RESUME') {
+                log.info('Executing RESUME operator command');
+                setSystemStatus('RUNNING', null, 'Operator requested resume via dashboard');
+                clearPendingCommand();
+            } else if (sysState.pending_command === 'KILL_SWITCH') {
+                log.warn('Executing KILL_SWITCH operator command');
+                marketClosePositions('TRADE_W');
+                positions.clear();
+                bridge.updateAccountMargin(positions);
+                syncAccountToDb();
+                clearPendingCommand();
+            }
+
+            const currentStatus = getSystemState().status;
+            const isPaused = currentStatus === 'PAUSED';
+
             const candles = await fetchEtcCandles(150);
             if (candles.length > 0) {
-                await evaluateStrategyTick(candles, true);
+                await evaluateStrategyTick(candles, true, isPaused);
             }
         } catch (err: any) {
-            console.error(`[TRADE W ERROR] Polling tick error:`, err?.message || err);
+            log.error({ err: err?.message || err }, 'TradeW polling cycle error');
         }
     };
 
     // Run first tick immediately
     await runCycle();
-    setInterval(runCycle, pollIntervalMs);
+    if (isRunning) {
+        pollTimer = setInterval(runCycle, pollIntervalMs);
+    }
 }
 
-// Automatically start if executed as primary process
 if (require.main === module) {
     startTradeWRunner().catch(err => {
-        console.error("Fatal Trade W Runner Error:", err);
+        log.fatal({ err }, 'Fatal Trade W Runner Error');
         process.exit(1);
     });
 }

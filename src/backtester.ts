@@ -1,17 +1,9 @@
 import Database from 'better-sqlite3';
-import path from 'path';
-import fs from 'fs';
-import { EMA, RSI, ADX, ATR } from 'technicalindicators';
+import { getCanonicalDbPath } from './db';
+import { config as coreConfig } from './config';
+import { StrategyEngine, CandleData, IndicatorSnapshot } from './strategy/core';
 
-// Initialize Database
-let dbPath = path.resolve(__dirname, '../data/market_data.db');
-if (!fs.existsSync(dbPath)) {
-    dbPath = path.resolve(process.cwd(), 'data/market_data.db');
-}
-if (!fs.existsSync(dbPath)) {
-    console.error("Database not found. Please run fetch_history.ts first.");
-    process.exit(1);
-}
+const dbPath = getCanonicalDbPath();
 const db = new Database(dbPath, { readonly: true });
 
 export interface Candle {
@@ -32,7 +24,7 @@ export interface Trade {
     durationMs: number;
     pnl: number;
     pnlPercent: number;
-    exitReason: 'EMA_CROSS' | 'TRAILING_STOP' | 'END_OF_DATA';
+    exitReason: 'EMA_CROSS' | 'TRAILING_STOP' | 'TAKE_PROFIT' | 'END_OF_DATA';
 }
 
 export interface StrategyConfig {
@@ -47,6 +39,7 @@ export interface StrategyConfig {
     atrPeriod?: number;
     atrMultiplier?: number;
     trailingStopMode?: 'intrabar' | 'close';
+    takeProfitRMultiplier?: number;
 }
 
 export interface BacktestResult {
@@ -65,15 +58,53 @@ export interface BacktestResult {
     winRate: number;
     profitFactor: number;
     maxDrawdown: number;
+    sharpeRatio: number;
+    sortinoRatio: number;
     trades: Trade[];
 }
 
-const INITIAL_BALANCE = 10000;
-const TAKER_FEE = 0.00075; // 0.075%
-const SLIPPAGE = 0.0005;   // 0.05%
+const INITIAL_BALANCE = coreConfig.exchange.initialCapital;
+const TAKER_FEE = coreConfig.exchange.takerFee;
+const SLIPPAGE = coreConfig.exchange.slippage;
 
 /**
- * Runs a backtest for a specific symbol, timeframe, and strategy configuration.
+ * Calculates Sharpe and Sortino ratios based on periodic returns.
+ * Annualized for 1-hour crypto candles (8,760 hours/year).
+ */
+export function calculateRiskAdjustedMetrics(
+    periodicReturns: number[],
+    periodsPerYear: number = 8760
+): { sharpeRatio: number; sortinoRatio: number } {
+    if (periodicReturns.length < 2) {
+        return { sharpeRatio: 0, sortinoRatio: 0 };
+    }
+
+    const n = periodicReturns.length;
+    const mean = periodicReturns.reduce((sum, r) => sum + r, 0) / n;
+
+    // Variance & Standard Deviation
+    const variance = periodicReturns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / (n - 1);
+    const stdDev = Math.sqrt(Math.max(0, variance));
+
+    // Downside deviation (returns < 0)
+    const negativeReturns = periodicReturns.filter(r => r < 0);
+    const downsideVariance = negativeReturns.length > 0
+        ? negativeReturns.reduce((sum, r) => sum + Math.pow(r, 2), 0) / negativeReturns.length
+        : 0;
+    const downsideDeviation = Math.sqrt(downsideVariance);
+
+    const annualizationFactor = Math.sqrt(periodsPerYear);
+    const sharpeRatio = stdDev > 0 ? (mean / stdDev) * annualizationFactor : 0;
+    const sortinoRatio = downsideDeviation > 0 ? (mean / downsideDeviation) * annualizationFactor : (mean > 0 ? 99.99 : 0);
+
+    return {
+        sharpeRatio: Number(sharpeRatio.toFixed(2)),
+        sortinoRatio: Number(sortinoRatio.toFixed(2)),
+    };
+}
+
+/**
+ * Runs a backtest for a specific symbol, timeframe, and strategy configuration consuming StrategyEngine.
  */
 export function runBacktest(
     symbol: string,
@@ -92,11 +123,18 @@ export function runBacktest(
         return null;
     }
 
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
-    const closes = candles.map(c => c.close);
+    const candleData: CandleData[] = candles.map(c => ({
+        timestamp: c.timestamp,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume
+    }));
 
-    // Indicator parameters with defaults per specification
+    // Indicator parameters
+    const fastPeriod = config.fastPeriod;
+    const slowPeriod = config.slowPeriod;
     const rsiPeriod = config.rsiPeriod ?? 14;
     const rsiMin = config.rsiMin ?? 40;
     const rsiMax = config.rsiMax ?? 65;
@@ -106,19 +144,21 @@ export function runBacktest(
     const atrMultiplier = config.atrMultiplier ?? 1.5;
     const trailingStopMode = config.trailingStopMode ?? 'intrabar';
 
-    // Calculate indicators over full dataset for numerical precision
-    const emaFastAll = EMA.calculate({ period: config.fastPeriod, values: closes });
-    const emaSlowAll = EMA.calculate({ period: config.slowPeriod, values: closes });
-    const rsiAll = RSI.calculate({ period: rsiPeriod, values: closes });
-    const adxAll = ADX.calculate({ period: adxPeriod, high: highs, low: lows, close: closes });
-    const atrAll = ATR.calculate({ period: atrPeriod, high: highs, low: lows, close: closes });
+    // Calculate indicators using StrategyEngine
+    const indicators = StrategyEngine.calculateIndicators(candleData, {
+        fastPeriod,
+        slowPeriod,
+        rsiPeriod,
+        adxPeriod,
+        atrPeriod,
+    });
 
     // Alignment offsets against candles array
-    const emaFastOffset = candles.length - emaFastAll.length;
-    const emaSlowOffset = candles.length - emaSlowAll.length;
-    const rsiOffset = candles.length - rsiAll.length;
-    const adxOffset = candles.length - adxAll.length;
-    const atrOffset = candles.length - atrAll.length;
+    const emaFastOffset = candles.length - indicators.emaFast.length;
+    const emaSlowOffset = candles.length - indicators.emaSlow.length;
+    const rsiOffset = candles.length - indicators.rsi.length;
+    const adxOffset = candles.length - indicators.adx.length;
+    const atrOffset = candles.length - indicators.atr.length;
 
     let balance = INITIAL_BALANCE;
     let cryptoAmount = 0;
@@ -127,21 +167,24 @@ export function runBacktest(
     let entryPriceRaw = 0;
     let entryBalance = 0;
     let highestSinceEntry = 0;
+    let lowestSinceEntry = 0;
     let trailingStop = 0;
 
     let maxEquity = INITIAL_BALANCE;
     let maxDrawdown = 0;
 
     const trades: Trade[] = [];
+    const equityCurve: number[] = [INITIAL_BALANCE];
+    const hourlyReturns: number[] = [];
 
     // Ensure all indicators are sufficiently warmed up
     const startIndex = Math.max(config.slowPeriod, 50, adxOffset, atrOffset);
 
     for (let i = startIndex; i < candles.length - 1; i++) {
         const candle = candles[i];
-        const nextCandle = candles[i + 1]; // Trade execution on next candle's open to eliminate lookahead bias
+        const nextCandle = candles[i + 1]; // Trade execution on next candle open to eliminate lookahead bias
 
-        // Calculate equity & update max drawdown
+        // Calculate current equity & update max drawdown
         let currentEquity = balance;
         if (inPosition) {
             currentEquity = cryptoAmount * candle.close;
@@ -150,25 +193,43 @@ export function runBacktest(
         const currentDrawdown = (maxEquity - currentEquity) / maxEquity;
         if (currentDrawdown > maxDrawdown) maxDrawdown = currentDrawdown;
 
-        // Current & previous indicator values
-        const currentFast = emaFastAll[i - emaFastOffset];
-        const previousFast = emaFastAll[i - 1 - emaFastOffset];
-        const currentSlow = emaSlowAll[i - emaSlowOffset];
-        const previousSlow = emaSlowAll[i - 1 - emaSlowOffset];
-        const currentRsi = rsiAll[i - rsiOffset];
-        const adxObj = adxAll[i - adxOffset];
-        const currentAdx = adxObj ? adxObj.adx : 0;
-        const currentAtr = atrAll[i - atrOffset];
+        // Track bar return for Sharpe & Sortino
+        const prevEquity = equityCurve[equityCurve.length - 1];
+        if (prevEquity > 0) {
+            hourlyReturns.push((currentEquity - prevEquity) / prevEquity);
+        }
+        equityCurve.push(currentEquity);
+
+        // Indicator snapshot at index i
+        const currentFast = indicators.emaFast[i - emaFastOffset];
+        const previousFast = indicators.emaFast[i - 1 - emaFastOffset];
+        const currentSlow = indicators.emaSlow[i - emaSlowOffset];
+        const previousSlow = indicators.emaSlow[i - 1 - emaSlowOffset];
+        const currentRsi = indicators.rsi[i - rsiOffset];
+        const currentAdx = indicators.adx[i - adxOffset]?.adx ?? 0;
+        const previousAdx = indicators.adx[i - 1 - adxOffset]?.adx ?? currentAdx;
+        const currentAtr = indicators.atr[i - atrOffset] ?? 0;
+
+        const snapshot: IndicatorSnapshot = {
+            currentEmaFast: currentFast,
+            previousEmaFast: previousFast,
+            currentEmaSlow: currentSlow,
+            previousEmaSlow: previousSlow,
+            currentRsi,
+            currentAdx,
+            previousAdx,
+            currentAtr,
+        };
 
         if (!inPosition) {
-            // Entry Condition:
-            // Fast EMA crosses above Slow EMA AND RSI in [40, 65] AND ADX > 25 (trend confirmation)
+            // Entry Condition evaluated by StrategyEngine logic:
+            // Fast EMA crosses above Slow EMA AND RSI in [rsiMin, rsiMax] AND ADX > adxThreshold
             const emaBullish = previousFast <= previousSlow && currentFast > currentSlow;
             const rsiValid = currentRsi >= rsiMin && currentRsi <= rsiMax;
             const adxValid = currentAdx > adxThreshold;
 
             if (emaBullish && rsiValid && adxValid) {
-                // Execute BUY on next candle open
+                // Execute BUY on next candle open with slippage and taker fee
                 const executionPrice = nextCandle.open * (1 + SLIPPAGE);
                 cryptoAmount = (balance * (1 - TAKER_FEE)) / executionPrice;
                 entryBalance = balance;
@@ -177,30 +238,35 @@ export function runBacktest(
                 entryTime = nextCandle.timestamp;
                 entryPriceRaw = executionPrice;
                 highestSinceEntry = nextCandle.open;
+                lowestSinceEntry = nextCandle.open;
                 trailingStop = nextCandle.open - (atrMultiplier * currentAtr);
             }
         } else {
-            // Update dynamic ATR trailing stop
-            highestSinceEntry = Math.max(highestSinceEntry, candle.high);
-            const proposedStop = highestSinceEntry - (atrMultiplier * currentAtr);
-            if (proposedStop > trailingStop) {
-                trailingStop = proposedStop;
-            }
+            // Position exit evaluation consuming StrategyEngine.evaluateExit
+            const exitEval = StrategyEngine.evaluateExit(
+                {
+                    symbol,
+                    side: 'LONG',
+                    amount: cryptoAmount,
+                    entryPrice: entryPriceRaw,
+                    currentPrice: candle.close,
+                    highestPrice: highestSinceEntry,
+                    lowestPrice: lowestSinceEntry,
+                    trailingStop,
+                    atr: currentAtr,
+                    entryTime,
+                },
+                candle,
+                snapshot,
+                true,
+                { atrMultiplier, trailingStopMode, slippage: SLIPPAGE }
+            );
 
-            // Exit Condition:
-            // 1) Fast EMA crosses below Slow EMA OR
-            // 2) 1.5x ATR trailing stop-loss is hit
-            const emaBearish = previousFast >= previousSlow && currentFast < currentSlow;
-            let stopHit = false;
+            highestSinceEntry = exitEval.newHighestPrice;
+            trailingStop = exitEval.newTrailingStop;
 
-            if (trailingStopMode === 'intrabar') {
-                stopHit = candle.low <= trailingStop;
-            } else {
-                stopHit = candle.close <= trailingStop;
-            }
-
-            if (emaBearish || stopHit) {
-                // Execute SELL on next candle open
+            if (exitEval.shouldExit && exitEval.reason) {
+                // Execute exit on next candle open
                 const executionPrice = nextCandle.open * (1 - SLIPPAGE);
                 const grossValue = cryptoAmount * executionPrice;
                 balance = grossValue * (1 - TAKER_FEE);
@@ -217,7 +283,7 @@ export function runBacktest(
                     durationMs: nextCandle.timestamp - entryTime,
                     pnl,
                     pnlPercent,
-                    exitReason: stopHit ? 'TRAILING_STOP' : 'EMA_CROSS'
+                    exitReason: exitEval.reason === 'TRAILING_STOP' ? 'TRAILING_STOP' : 'EMA_CROSS'
                 });
 
                 inPosition = false;
@@ -265,6 +331,8 @@ export function runBacktest(
     const netPnl = balance - INITIAL_BALANCE;
     const netPnlPercent = (netPnl / INITIAL_BALANCE) * 100;
 
+    const { sharpeRatio, sortinoRatio } = calculateRiskAdjustedMetrics(hourlyReturns);
+
     return {
         symbol,
         timeframe,
@@ -281,6 +349,8 @@ export function runBacktest(
         winRate,
         profitFactor,
         maxDrawdown: maxDrawdown * 100,
+        sharpeRatio,
+        sortinoRatio,
         trades
     };
 }
@@ -291,9 +361,6 @@ export const EMA_VARIATIONS: StrategyConfig[] = [
     { fastPeriod: 50, slowPeriod: 200, name: '50 / 200 (Macro)', atrMultiplier: 1.5, adxThreshold: 25 },
 ];
 
-/**
- * Formats a number with sign and decimals.
- */
 function formatPnl(amount: number): string {
     const sign = amount >= 0 ? '+$' : '-$';
     return `${sign}${Math.abs(amount).toFixed(2)}`;
@@ -320,48 +387,23 @@ export function runGridSearch() {
         }
     }
 
-    // Terminal Markdown Table Header
     console.log(`### Parameter Grid Search: Backtest Performance Comparison\n`);
-    console.log(`| Symbol | EMA Variation | Trades | Win Rate (%) | Net Profit/Loss ($) | Return (%) | Max Drawdown (%) | Profit Factor | Status (PF > 1.2) |`);
-    console.log(`| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |`);
+    console.log(`| Symbol | EMA Variation | Trades | Win Rate (%) | Net PnL ($) | Return (%) | Max DD (%) | Profit Factor | Sharpe | Sortino | Status |`);
+    console.log(`| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |`);
 
     for (const r of results) {
         const pfString = r.profitFactor === 999 ? 'N/A' : r.profitFactor.toFixed(2);
         const passed = r.profitFactor > 1.2;
-        const status = passed ? '✅ PASS (> 1.2)' : '❌ FAIL (<= 1.2)';
+        const status = passed ? '✅ PASS' : '❌ FAIL';
         const pnlStr = formatPnl(r.netPnl);
         const retStr = `${r.netPnlPercent >= 0 ? '+' : ''}${r.netPnlPercent.toFixed(2)}%`;
 
         console.log(
-            `| **${r.symbol}** | ${r.variationName.padEnd(16)} | ${r.totalTrades.toString().padStart(6)} | ${r.winRate.toFixed(2).padStart(11)}% | ${pnlStr.padStart(18)} | ${retStr.padStart(10)} | ${r.maxDrawdown.toFixed(2).padStart(15)}% | ${pfString.padStart(12)} | ${status} |`
+            `| **${r.symbol}** | ${r.variationName.padEnd(16)} | ${r.totalTrades.toString().padStart(6)} | ${r.winRate.toFixed(2).padStart(10)}% | ${pnlStr.padStart(13)} | ${retStr.padStart(10)} | ${r.maxDrawdown.toFixed(2).padStart(8)}% | ${pfString.padStart(12)} | ${r.sharpeRatio.toFixed(2).padStart(6)} | ${r.sortinoRatio.toFixed(2).padStart(7)} | ${status} |`
         );
     }
 
     console.log(`\n`);
-
-    // Verification & Live Deployment Recommendations
-    console.log(`========================================================================================`);
-    console.log(` VERIFICATION & DEPLOYMENT RECOMMENDATION REPORT (Target: Profit Factor > 1.2)`);
-    console.log(`========================================================================================`);
-
-    const qualified = results.filter(r => r.profitFactor > 1.2);
-    if (qualified.length > 0) {
-        console.log(`\n[SUCCESS] The following configurations satisfy the verification target (PF > 1.2):`);
-        for (const q of qualified) {
-            console.log(` - ${q.symbol} [${q.variationName}]: Profit Factor = ${q.profitFactor.toFixed(2)}, Win Rate = ${q.winRate.toFixed(2)}%, Net PnL = ${formatPnl(q.netPnl)}, Max DD = ${q.maxDrawdown.toFixed(2)}%`);
-        }
-    } else {
-        console.log(`\n[WARNING] No configurations met the target threshold of Profit Factor > 1.2.`);
-    }
-
-    console.log(`\n[Key Observations & Quantitative Analysis]:`);
-    console.log(` 1. Market Regime Filter (ADX > 25): Successfully eliminates ranging whip-saw trades.`);
-    console.log(`    - BTC/USDT 20/50 win rate surged from 37.93% (unfiltered baseline) to 66.67%, converting a -$763.95 loss into +$55.23 profit with a Profit Factor of 1.65.`);
-    console.log(`    - ETH/USDT 50/200 preserved capital and achieved a Profit Factor of 1.19 (intrabar) / 2.06 (close-based).`);
-    console.log(` 2. Trailing Stop-Loss (1.5x ATR): Radically compresses tail risk. Max drawdown on BTC/USDT dropped from 13.13% to 1.10%, and on ETH/USDT from 22.37% to 1.10%.`);
-    console.log(` 3. 9/21 (Fast) is prone to noise and high turnover on 1h bars (win rate <= 33%), whereas 20/50 (Medium) is the optimal parameter set for BTC/USDT.`);
-    console.log(`========================================================================================\n`);
-
     return results;
 }
 

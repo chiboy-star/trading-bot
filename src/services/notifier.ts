@@ -1,8 +1,7 @@
-import dotenv from 'dotenv';
-import path from 'path';
+import config from '../core/config';
+import logger from '../core/logger';
 
-// Load environment variables from .env in project root
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const log = logger.child({ module: 'notifier' });
 
 export interface OrderEnteredParams {
     symbol: string;
@@ -53,9 +52,9 @@ export interface DiscordEmbed {
  * Fails silently with a console warning if DISCORD_WEBHOOK_URL is unset.
  */
 export async function sendDiscordAlert(embed: DiscordEmbed): Promise<boolean> {
-    const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+    const webhookUrl = config.notifications.discordWebhookUrl;
     if (!webhookUrl || webhookUrl.trim() === '') {
-        console.warn("\x1b[33m[NOTIFIER WARNING]\x1b[0m DISCORD_WEBHOOK_URL is not set. Discord alert skipped.");
+        log.warn('DISCORD_WEBHOOK_URL is not set. Discord alert skipped.');
         return false;
     }
 
@@ -75,13 +74,13 @@ export async function sendDiscordAlert(embed: DiscordEmbed): Promise<boolean> {
         });
 
         if (!response.ok) {
-            console.error(`\x1b[31m[NOTIFIER ERROR]\x1b[0m Discord webhook responded with status ${response.status}: ${response.statusText}`);
+            log.error({ status: response.status, statusText: response.statusText }, 'Discord webhook responded with error status');
             return false;
         }
 
         return true;
     } catch (err) {
-        console.error("\x1b[31m[NOTIFIER ERROR]\x1b[0m Failed to send Discord webhook:", err);
+        log.error({ err }, 'Failed to send Discord webhook');
         return false;
     }
 }
@@ -105,12 +104,12 @@ export async function notifyOrderEntered(data: OrderEnteredParams): Promise<bool
             { name: "Pair", value: `\`${data.symbol}\``, inline: true },
             { name: "Entry Price", value: `**$${data.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**`, inline: true },
             { name: "Position Size", value: `${data.amount.toFixed(4)} (~$${cost.toFixed(2)})`, inline: true },
-            { name: isShort ? "Initial Stop-Loss (Above Entry)" : "Initial Stop-Loss (1.5x ATR)", value: `\`$${data.initialStop.toFixed(2)}\``, inline: true },
+            { name: isShort ? "Initial Stop-Loss (Above Entry)" : `Initial Stop-Loss (${config.strategy.atrMultiplier}x ATR)`, value: `\`$${data.initialStop.toFixed(2)}\``, inline: true },
             ...(data.atr ? [{ name: "ATR (14)", value: `$${data.atr.toFixed(2)}`, inline: true }] : []),
             { name: "Timestamp", value: isoTime, inline: false }
         ],
         timestamp: isoTime,
-        footer: { text: "Paper Trading Engine • ADX Market Regime + 1.5x ATR Trailing Stop" }
+        footer: { text: `Paper Trading Engine • ADX Market Regime + ${config.strategy.atrMultiplier}x ATR Trailing Stop` }
     };
 
     return sendDiscordAlert(embed);
@@ -128,9 +127,9 @@ export async function notifyPositionClosed(data: PositionClosedParams): Promise<
     const pnlFormatted = `${pnlSign}${Math.abs(data.pnl).toFixed(2)} (${pnlPctSign}${data.pnlPercent.toFixed(2)}%)`;
 
     const readableReason = data.reason === 'TRAILING_STOP' 
-        ? 'Dynamic 1.5x ATR Trailing Stop Hit (Long)'
+        ? `Dynamic ${config.strategy.atrMultiplier}x ATR Trailing Stop Hit (Long)`
         : data.reason === 'TRAILING_STOP (SHORT)'
-        ? 'Dynamic 1.5x ATR Trailing Stop Hit (Short)'
+        ? `Dynamic ${config.strategy.atrMultiplier}x ATR Trailing Stop Hit (Short)`
         : data.reason === 'EMA_CROSS'
         ? 'Trend Reversal (20 EMA crossed below 50 EMA)'
         : data.reason === 'EMA_CROSS (SHORT)'

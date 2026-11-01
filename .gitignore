@@ -6,6 +6,8 @@
 # SQLite Database Files
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 market_data.db
@@ -14,6 +16,22 @@ market_data.db
 node_modules/
 .pnp
 .pnp.js
+
+# Python Virtual Environments & Cache
+.venv/
+*/.venv/
+venv/
+*/venv/
+env/
+*/env/
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Build Outputs & Compilations
 dist/

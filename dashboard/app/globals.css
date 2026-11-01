@@ -1,26 +1,35 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
+@layer base {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --bg-paper: #FAF9F6;
+    --text-ink: #111315;
+    --border-hairline: #E5E7EB;
+    --text-caption: #525866;
+    --color-sage: #2D6A4F;
+    --bg-sage: #E8F5E9;
+    --color-muted-red: #B91C1C;
+    --bg-muted-red: #FEE2E2;
+    --color-graphite: #4B5563;
+    --bg-graphite: #F3F4F6;
+  }
+
+  body {
+    background-color: var(--bg-paper);
+    color: var(--text-ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Tabular figures for all financial numbers and timestamps */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Crisp hairline borders */
+.border-hairline {
+  border-color: #E5E7EB;
 }

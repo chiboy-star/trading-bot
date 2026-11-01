@@ -1,0 +1,250 @@
+{
+  "benchmark": {
+    "start_date": "2022-04-24",
+    "end_date": "2026-10-23",
+    "days": 1644,
+    "bnh_total_return_pct": 106.13623397862551,
+    "bnh_cagr_pct": 17.42170382415351,
+    "bnh_sharpe": 0.5723707066356245,
+    "bnh_max_dd_pct": -60.97648514851485
+  },
+  "h1": {
+    "metrics": {
+      "trades": 92,
+      "win_rate": 21.73913043478261,
+      "gross_pf": 1.4147489752739033,
+      "net_pf": 1.1999176269568161,
+      "net_pnl": 969.6500683014222,
+      "expectancy_r": 0.052698373277251215,
+      "total_fees": 247.42894134084946,
+      "total_funding": 735.148884125515
+    },
+    "by_symbol": {
+      "BTC_USDT": {
+        "trades": 43,
+        "win_rate": 25.581395348837212,
+        "gross_pf": 2.0097391882192412,
+        "net_pf": 1.6928943465131054,
+        "net_pnl": 1428.2764266716188,
+        "expectancy_r": 0.1660786542641417,
+        "total_fees": 130.3458874335855,
+        "total_funding": 409.3367555438948
+      },
+      "ETH_USDT": {
+        "trades": 49,
+        "win_rate": 18.367346938775512,
+        "gross_pf": 0.9821698728521271,
+        "net_pf": 0.8355546539595385,
+        "net_pnl": -458.62635837019633,
+        "expectancy_r": -0.046798607996958785,
+        "total_fees": 117.08305390726393,
+        "total_funding": 325.8121285816202
+      }
+    },
+    "walk_forward": [
+      {
+        "window": 1,
+        "period": "2022-04-24 to 2023-06-08",
+        "trades": 7,
+        "net_pf": 1.9333703974918068,
+        "expectancy_r": 0.148751408057155
+      },
+      {
+        "window": 2,
+        "period": "2023-06-09 to 2024-07-23",
+        "trades": 10,
+        "net_pf": 1.4208013074237649,
+        "expectancy_r": 0.11490155000383077
+      },
+      {
+        "window": 3,
+        "period": "2024-07-24 to 2025-09-07",
+        "trades": 8,
+        "net_pf": 0.8242751702410533,
+        "expectancy_r": -0.03850667619477485
+      },
+      {
+        "window": 4,
+        "period": "2025-09-08 to 2026-10-23",
+        "trades": 0,
+        "net_pf": 0.0,
+        "expectancy_r": 0.0
+      }
+    ],
+    "sensitivity": [
+      {
+        "fast_ema": 40,
+        "trailing_mult": 2.4,
+        "net_pf": 1.3021956759827276,
+        "exp_r": 0.09499040973539637
+      },
+      {
+        "fast_ema": 40,
+        "trailing_mult": 3.0,
+        "net_pf": 1.7812792650177562,
+        "exp_r": 0.18888409347613844
+      },
+      {
+        "fast_ema": 40,
+        "trailing_mult": 3.6,
+        "net_pf": 2.2317426307235504,
+        "exp_r": 0.22433985118014796
+      },
+      {
+        "fast_ema": 50,
+        "trailing_mult": 2.4,
+        "net_pf": 1.339401341606978,
+        "exp_r": 0.1136530993871037
+      },
+      {
+        "fast_ema": 50,
+        "trailing_mult": 3.0,
+        "net_pf": 1.6928943465131054,
+        "exp_r": 0.1660786542641417
+      },
+      {
+        "fast_ema": 50,
+        "trailing_mult": 3.6,
+        "net_pf": 2.019641519649853,
+        "exp_r": 0.19429635274313758
+      },
+      {
+        "fast_ema": 60,
+        "trailing_mult": 2.4,
+        "net_pf": 1.2644957086841797,
+        "exp_r": 0.09132709133244007
+      },
+      {
+        "fast_ema": 60,
+        "trailing_mult": 3.0,
+        "net_pf": 1.5110590991097301,
+        "exp_r": 0.1366893626589263
+      },
+      {
+        "fast_ema": 60,
+        "trailing_mult": 3.6,
+        "net_pf": 1.822252097391945,
+        "exp_r": 0.16282120998552588
+      }
+    ],
+    "mc_p95": 4.252506920251443
+  },
+  "h2": {
+    "weeks": 230,
+    "total_return_pct": 2556.9740744588694,
+    "cagr_pct": 109.91109462657609,
+    "sharpe": 0.9901315408395943,
+    "max_dd_pct": -68.89903553024573,
+    "gross_pf": 1.721456795788386,
+    "net_pf": 1.6140485481796507,
+    "fees_paid": 7246.285327181828,
+    "slippage_paid": 9456.456220440543,
+    "funding_paid": 15145.879441495055,
+    "sensitivity": [
+      {
+        "lookback": 21,
+        "top_n": 2,
+        "return_pct": 2718.998909326948,
+        "sharpe": 1.002378067673581,
+        "net_pf": 1.5044295424104024
+      },
+      {
+        "lookback": 21,
+        "top_n": 3,
+        "return_pct": 525.4233755766529,
+        "sharpe": 0.790364658258732,
+        "net_pf": 1.3057365097687188
+      },
+      {
+        "lookback": 28,
+        "top_n": 2,
+        "return_pct": 2556.9740744588694,
+        "sharpe": 0.9901315408395943,
+        "net_pf": 1.6140485481796507
+      },
+      {
+        "lookback": 28,
+        "top_n": 3,
+        "return_pct": 1160.4254620255533,
+        "sharpe": 0.9526643418351614,
+        "net_pf": 1.587720995813146
+      },
+      {
+        "lookback": 35,
+        "top_n": 2,
+        "return_pct": 910.535650358038,
+        "sharpe": 0.8780394071941653,
+        "net_pf": 1.4655614185128516
+      },
+      {
+        "lookback": 35,
+        "top_n": 3,
+        "return_pct": 492.3411046306339,
+        "sharpe": 0.8175675165491869,
+        "net_pf": 1.4265847276418417
+      }
+    ]
+  },
+  "h3": {
+    "metrics": {
+      "trades": 72,
+      "win_rate": 38.88888888888889,
+      "gross_pf": 0.6801331335230641,
+      "net_pf": 0.6266969706069123,
+      "net_pnl": -3004.4430348678547,
+      "expectancy_r": -0.2086418774213788,
+      "total_fees": 647.6399163828215,
+      "total_funding": -125.18332003875626
+    },
+    "counts": {
+      "BTC_USDT": 4,
+      "ETH_USDT": 21,
+      "SOL_USDT": 16,
+      "DOGE_USDT": 12,
+      "XRP_USDT": 6,
+      "1000PEPE_USDT": 13
+    }
+  },
+  "h4": {
+    "BTC_USDT": {
+      "carry_windows": 5,
+      "total_active_days": 189.0,
+      "gross_yield_pct": 11.205891999999999,
+      "net_yield_pct": 10.105891999999999,
+      "trading_friction_pct": 1.1,
+      "annualized_net_yield_pct": 19.51666973544973
+    },
+    "ETH_USDT": {
+      "carry_windows": 4,
+      "total_active_days": 210.0,
+      "gross_yield_pct": 12.195185,
+      "net_yield_pct": 11.315185,
+      "trading_friction_pct": 0.88,
+      "annualized_net_yield_pct": 19.666869166666668
+    },
+    "SOL_USDT": {
+      "carry_windows": 9,
+      "total_active_days": 312.6666666666667,
+      "gross_yield_pct": 18.545369,
+      "net_yield_pct": 16.565369,
+      "trading_friction_pct": 1.9800000000000002,
+      "annualized_net_yield_pct": 19.33803737206823
+    },
+    "DOGE_USDT": {
+      "carry_windows": 5,
+      "total_active_days": 267.33333333333337,
+      "gross_yield_pct": 18.055776,
+      "net_yield_pct": 16.955776,
+      "trading_friction_pct": 1.1,
+      "annualized_net_yield_pct": 23.150342543640896
+    },
+    "SUI_USDT": {
+      "carry_windows": 3,
+      "total_active_days": 217.0,
+      "gross_yield_pct": 17.227490000000003,
+      "net_yield_pct": 16.567490000000003,
+      "trading_friction_pct": 0.66,
+      "annualized_net_yield_pct": 27.866976267281107
+    }
+  }
+}

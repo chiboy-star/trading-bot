@@ -1,140 +1,32 @@
 import ccxt from 'ccxt';
-import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import dotenv from 'dotenv';
-import { EMA, RSI, ADX, ATR } from 'technicalindicators';
+import { db, updateHeartbeat, getSystemState, setSystemStatus, clearPendingCommand, logActivity, marketClosePositions, closeDb, upsertMonitoredMarketState } from './db';
+import config, { DEFAULT_CORE_PAIRS, DEFAULT_SATELLITE_PAIRS, getSlippageForSymbol } from './config';
+import { createLogger } from './utils/logger';
+import { StrategyEngine, RiskManager, CandleData, SetupType } from './strategy/core';
+import { StrategyLearner, SetupProximity } from './strategy/learner';
 import { notifyOrderEntered, notifyPositionClosed, notifyCircuitBreaker } from './services/notifier';
 import { DynamicAssetScreener, getMonitoredPairs } from './screener';
 
-// Load environment variables (.env)
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const log = createLogger('bybit-runner');
 
-// Database setup - always targets canonical root data/market_data.db
-function getCanonicalDbPath(): string {
-    const rootPath = path.resolve(process.cwd(), 'data/market_data.db');
-    if (fs.existsSync(rootPath)) return rootPath;
-    const parentPath = path.resolve(process.cwd(), '../data/market_data.db');
-    if (fs.existsSync(parentPath)) return parentPath;
-    return path.resolve(__dirname, '../../data/market_data.db');
-}
-export const db = new Database(getCanonicalDbPath());
+// ANSI Colors for terminal status logging
+const C = {
+    RESET: "\x1b[0m",
+    RED: "\x1b[31m",
+    GREEN: "\x1b[32m",
+    YELLOW: "\x1b[33m",
+    BLUE: "\x1b[34m",
+    CYAN: "\x1b[36m",
+    MAGENTA: "\x1b[35m",
+    DIM: "\x1b[2m",
+    BOLD: "\x1b[1m"
+};
 
-// Initialize schema for paper trading & dashboard synchronization
-db.exec(`
-    CREATE TABLE IF NOT EXISTS candles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        timeframe TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        open REAL NOT NULL,
-        high REAL NOT NULL,
-        low REAL NOT NULL,
-        close REAL NOT NULL,
-        volume REAL NOT NULL,
-        UNIQUE(symbol, timeframe, timestamp)
-    );
+export { db };
 
-    CREATE TABLE IF NOT EXISTS paper_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        type TEXT NOT NULL,
-        price REAL NOT NULL,
-        amount REAL NOT NULL,
-        fee REAL NOT NULL,
-        pnl REAL DEFAULT 0,
-        pnl_percent REAL DEFAULT 0,
-        timestamp INTEGER NOT NULL,
-        direction TEXT DEFAULT 'LONG',
-        execution_mode TEXT DEFAULT 'LIVE_FORWARD',
-        broker TEXT DEFAULT 'BYBIT'
-    );
-
-    CREATE TABLE IF NOT EXISTS active_positions (
-        symbol TEXT PRIMARY KEY,
-        side TEXT DEFAULT 'LONG',
-        amount REAL NOT NULL,
-        entry_price REAL NOT NULL,
-        current_price REAL NOT NULL,
-        highest_price REAL NOT NULL,
-        lowest_price REAL DEFAULT 0,
-        trailing_stop REAL NOT NULL,
-        atr REAL NOT NULL,
-        pnl REAL DEFAULT 0,
-        pnl_percent REAL DEFAULT 0,
-        entry_time INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        broker TEXT DEFAULT 'BYBIT'
-    );
-
-    CREATE TABLE IF NOT EXISTS bot_state (
-        id INTEGER PRIMARY KEY,
-        capital REAL NOT NULL,
-        initial_capital REAL NOT NULL,
-        circuit_breaker_halted INTEGER DEFAULT 0,
-        lockout_until INTEGER DEFAULT 0,
-        updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS monitored_pairs (
-        symbol TEXT PRIMARY KEY,
-        base_asset TEXT NOT NULL,
-        quote_asset TEXT NOT NULL,
-        daily_adx REAL NOT NULL,
-        volume_24h REAL NOT NULL,
-        rank INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS daily_losses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp INTEGER NOT NULL,
-        amount REAL NOT NULL
-    );
-`);
-
-// Safe column migrations for existing databases
-try {
-    const cols = db.prepare("PRAGMA table_info(paper_trades)").all() as { name: string }[];
-    const colNames = cols.map(c => c.name);
-    if (!colNames.includes('pnl')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN pnl REAL DEFAULT 0;");
-    }
-    if (!colNames.includes('pnl_percent')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN pnl_percent REAL DEFAULT 0;");
-    }
-    if (!colNames.includes('direction')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN direction TEXT DEFAULT 'LONG';");
-    }
-    if (!colNames.includes('execution_mode')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN execution_mode TEXT DEFAULT 'LIVE_FORWARD';");
-    }
-    if (!colNames.includes('broker')) {
-        db.exec("ALTER TABLE paper_trades ADD COLUMN broker TEXT DEFAULT 'BYBIT';");
-    }
-} catch (e) {
-    console.warn(`\x1b[33m[DB MIGRATION WARNING]\x1b[0m paper_trades migration issue:`, e);
-}
-
-try {
-    const posCols = db.prepare("PRAGMA table_info(active_positions)").all() as { name: string }[];
-    const posColNames = posCols.map(c => c.name);
-    if (!posColNames.includes('side')) {
-        db.exec("ALTER TABLE active_positions ADD COLUMN side TEXT DEFAULT 'LONG';");
-    }
-    if (!posColNames.includes('lowest_price')) {
-        db.exec("ALTER TABLE active_positions ADD COLUMN lowest_price REAL DEFAULT 0;");
-    }
-    if (!posColNames.includes('broker')) {
-        db.exec("ALTER TABLE active_positions ADD COLUMN broker TEXT DEFAULT 'BYBIT';");
-    }
-} catch (e) {
-    console.warn(`\x1b[33m[DB MIGRATION WARNING]\x1b[0m active_positions migration issue:`, e);
-}
-
-// Prepared database statements
+// Prepared statements with composite primary key (symbol, broker)
 const upsertCandleStmt = db.prepare(`
     INSERT INTO candles (symbol, timeframe, timestamp, open, high, low, close, volume)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -147,14 +39,15 @@ const upsertCandleStmt = db.prepare(`
 `);
 
 const insertTradeStmt = db.prepare(`
-    INSERT INTO paper_trades (order_id, symbol, side, type, price, amount, fee, pnl, pnl_percent, timestamp, direction, execution_mode, broker)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO paper_trades (
+        order_id, symbol, side, type, price, amount, fee, pnl, pnl_percent, timestamp, direction, execution_mode, broker, setup_type, signal_price, fill_price, slippage, funding_pnl
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const upsertActivePosStmt = db.prepare(`
-    INSERT INTO active_positions (symbol, side, amount, entry_price, current_price, highest_price, lowest_price, trailing_stop, atr, pnl, pnl_percent, entry_time, updated_at, broker)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(symbol) DO UPDATE SET
+    INSERT INTO active_positions (symbol, broker, side, amount, entry_price, current_price, highest_price, lowest_price, trailing_stop, atr, pnl, pnl_percent, entry_time, updated_at, setup_type, signal_price, accumulated_funding)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(symbol, broker) DO UPDATE SET
         side = excluded.side,
         amount = excluded.amount,
         entry_price = excluded.entry_price,
@@ -166,11 +59,13 @@ const upsertActivePosStmt = db.prepare(`
         pnl = excluded.pnl,
         pnl_percent = excluded.pnl_percent,
         updated_at = excluded.updated_at,
-        broker = excluded.broker;
+        setup_type = excluded.setup_type,
+        signal_price = excluded.signal_price,
+        accumulated_funding = excluded.accumulated_funding;
 `);
 
 const deleteActivePosStmt = db.prepare(`
-    DELETE FROM active_positions WHERE symbol = ?
+    DELETE FROM active_positions WHERE symbol = ? AND broker = 'BYBIT'
 `);
 
 const insertDailyLossStmt = db.prepare(`
@@ -192,64 +87,13 @@ const updateBotStateStmt = db.prepare(`
         updated_at = excluded.updated_at;
 `);
 
-// ANSI Colors for terminal logging
-const C = {
-    RESET: "\x1b[0m",
-    RED: "\x1b[31m",
-    GREEN: "\x1b[32m",
-    YELLOW: "\x1b[33m",
-    BLUE: "\x1b[34m",
-    CYAN: "\x1b[36m",
-    MAGENTA: "\x1b[35m",
-    DIM: "\x1b[2m",
-    BOLD: "\x1b[1m"
-};
-
-// Periodic summary tracking
-let lastSummaryTime = Date.now();
-const SUMMARY_INTERVAL = 5 * 60 * 1000; // 5 minutes
-
-function maybePrintSummary() {
-    const now = Date.now();
-    if (now - lastSummaryTime >= SUMMARY_INTERVAL) {
-        lastSummaryTime = now;
-        // Use latest DB current_price for accurate unrealized PnL (not watermarks)
-        const totalUnrealized = Array.from(positions.values()).reduce((sum, p) => {
-            const posRow = db.prepare('SELECT current_price FROM active_positions WHERE symbol = ?').get(p.symbol) as { current_price: number } | undefined;
-            const curPrice = posRow ? posRow.current_price : p.entryPrice;
-            if (p.side === 'LONG') {
-                return sum + (p.amount * curPrice - p.amount * p.entryPrice);
-            } else {
-                return sum + (p.amount * p.entryPrice - p.amount * curPrice);
-            }
-        }, 0);
-        const pnlPct = ((capital - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100);
-        const pnlSign = pnlPct >= 0 ? '+' : '';
-        const unrealizedSign = totalUnrealized >= 0 ? '+' : '';
-        console.log(`\n${C.CYAN}${C.BOLD}⏰ 5-MIN STATUS UPDATE${C.RESET}`);
-        console.log(`${C.CYAN}───────────────────────────────────────────────────${C.RESET}`);
-        console.log(`   💰 Balance: $${capital.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}% overall)`);
-        console.log(`   📊 Watching: ${monitoredSymbols.length} coins (${monitoredSymbols.join(', ')})`);
-        console.log(`   📂 Open Trades: ${positions.size} | Unrealized: ${unrealizedSign}$${Math.abs(totalUnrealized).toFixed(2)}`);
-        if (positions.size > 0) {
-            for (const [sym, pos] of positions) {
-                const dirEmoji = pos.side === 'LONG' ? '🟢' : '🔴';
-                console.log(`       ${dirEmoji} ${sym} (${pos.side}) — Entry: $${pos.entryPrice.toFixed(2)} | Stop: $${pos.trailingStop.toFixed(2)}`);
-            }
-        }
-        const isLocked = Date.now() < lockoutUntil;
-        console.log(`   🛡️  Safety: ${isLocked ? '⛔ HALTED (circuit breaker active)' : '✅ Normal — all systems go'}`);
-        console.log(`${C.CYAN}───────────────────────────────────────────────────${C.RESET}\n`);
-    }
-}
-
-// Strategy & Risk Configuration
-export const INITIAL_CAPITAL = 10000;
-export const ATR_MULTIPLIER = 1.5;
-export const MAX_RISK_PCT = 0.02; // Risk strictly 2% of portfolio per position
-export const TAKER_FEE = 0.00075; // 0.075%
-export const SLIPPAGE = 0.0005;   // 0.05%
-export const TIMEFRAME = '1h';
+// Strategy & Risk Configuration from core config
+export const INITIAL_CAPITAL = config.exchange.initialCapital;
+export const ATR_MULTIPLIER = config.strategy.atrMultiplier;
+export const MAX_RISK_PCT = config.risk.maxRiskPct;
+export const TAKER_FEE = config.exchange.takerFee;
+export const SLIPPAGE = config.exchange.slippage;
+export const TIMEFRAME = config.exchange.timeframe;
 
 export interface Position {
     symbol: string;
@@ -261,63 +105,86 @@ export interface Position {
     trailingStop: number;
     entryTime: number;
     atr: number;
+    setupType: SetupType;
+    takeProfitPrice?: number;
+    signalPrice?: number;
+    slippageRate?: number;
+    accumulatedFunding?: number;
+    lastFundingTime?: number;
 }
 
 // In-memory state tracking
 let capital = INITIAL_CAPITAL;
 const positions: Map<string, Position> = new Map();
+const lastTradeClosedTime: Record<string, number> = {};
 let dailyLosses: { timestamp: number, amount: number }[] = [];
 let lockoutUntil = 0;
-let monitoredSymbols: string[] = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+let lastTradeTime = 0;
+let closestSetup: SetupProximity | undefined = undefined;
+let monitoredSymbols: string[] = [...DEFAULT_CORE_PAIRS, ...DEFAULT_SATELLITE_PAIRS];
 
-/**
- * Persists a loss record to SQLite and adds it to the in-memory array.
- * This ensures the circuit breaker survives bot restarts.
- */
-function recordDailyLoss(timestamp: number, amount: number) {
-    dailyLosses.push({ timestamp, amount });
-    insertDailyLossStmt.run(timestamp, amount);
-}
-
-// Restore capital and positions from SQLite if present
+// Restore capital, losses, and active positions from SQLite
 (() => {
-    const state = db.prepare('SELECT capital, circuit_breaker_halted, lockout_until FROM bot_state WHERE id = 1').get() as any;
-    if (state) {
-        capital = state.capital;
-        lockoutUntil = state.lockout_until;
-    } else {
-        updateBotStateStmt.run(INITIAL_CAPITAL, INITIAL_CAPITAL, 0, 0, Date.now());
-    }
+    try {
+        const state = db.prepare('SELECT capital, circuit_breaker_halted, lockout_until FROM bot_state WHERE id = 1').get() as any;
+        if (state) {
+            // Recalculate true Realized Capital: Initial Capital + Total Closed Trade PnL - Entry Fees
+            const closedTradesRow = db.prepare("SELECT COALESCE(SUM(pnl), 0) as totalPnl FROM paper_trades WHERE type != 'ENTRY'").get() as any;
+            const entryFeesRow = db.prepare("SELECT COALESCE(SUM(fee), 0) as totalFees FROM paper_trades WHERE type = 'ENTRY'").get() as any;
+            const realizedPnl = Number(closedTradesRow?.totalPnl || 0);
+            const entryFees = Number(entryFeesRow?.totalFees || 0);
+            capital = INITIAL_CAPITAL + realizedPnl - entryFees;
+            lockoutUntil = Number(state.lockout_until || 0);
+        } else {
+            capital = INITIAL_CAPITAL;
+            updateBotStateStmt.run(INITIAL_CAPITAL, INITIAL_CAPITAL, 0, 0, Date.now());
+        }
 
-    // Restore daily losses from SQLite (rolling 24h window)
-    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    cleanOldLossesStmt.run(twentyFourHoursAgo);
-    const savedLosses = db.prepare('SELECT timestamp, amount FROM daily_losses ORDER BY timestamp ASC').all() as { timestamp: number, amount: number }[];
-    dailyLosses = savedLosses;
+        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+        cleanOldLossesStmt.run(twentyFourHoursAgo);
+        dailyLosses = db.prepare('SELECT timestamp, amount FROM daily_losses ORDER BY timestamp ASC').all() as { timestamp: number, amount: number }[];
 
-    const savedPositions = db.prepare('SELECT * FROM active_positions').all() as any[];
-    for (const p of savedPositions) {
-        positions.set(p.symbol, {
-            symbol: p.symbol,
-            side: (p.side === 'SHORT' ? 'SHORT' : 'LONG'),
-            amount: p.amount,
-            entryPrice: p.entry_price,
-            highestPrice: p.highest_price,
-            lowestPrice: p.lowest_price ?? p.entry_price,
-            trailingStop: p.trailing_stop,
-            entryTime: p.entry_time,
-            atr: p.atr
-        });
-    }
+        const savedPositions = db.prepare("SELECT * FROM active_positions WHERE broker = 'BYBIT'").all() as any[];
+        for (const p of savedPositions) {
+            const entryPrice = Number(p.entry_price);
+            const highestPrice = Number(p.highest_price) > 0 ? Number(p.highest_price) : entryPrice;
+            const lowestPrice = (Number(p.lowest_price) > 0) ? Number(p.lowest_price) : entryPrice;
+            const defaultStop = p.side === 'SHORT' ? entryPrice * 1.05 : entryPrice * 0.95;
+            const trailingStop = Number(p.trailing_stop) > 0 ? Number(p.trailing_stop) : defaultStop;
 
-    // Initialize monitored pairs
-    const pairs = getMonitoredPairs();
-    if (pairs && pairs.length > 0) {
-        monitoredSymbols = pairs;
+            positions.set(p.symbol, {
+                symbol: p.symbol,
+                side: p.side === 'SHORT' ? 'SHORT' : 'LONG',
+                amount: Number(p.amount),
+                entryPrice,
+                highestPrice,
+                lowestPrice,
+                trailingStop,
+                entryTime: Number(p.entry_time),
+                atr: Number(p.atr),
+                setupType: p.setup_type || 'EMA_CROSSOVER',
+                signalPrice: p.signal_price ? Number(p.signal_price) : entryPrice,
+                slippageRate: getSlippageForSymbol(p.symbol),
+                accumulatedFunding: Number(p.accumulated_funding || 0),
+                lastFundingTime: Number(p.entry_time)
+            });
+        }
+
+        const lastTradeRow = db.prepare('SELECT timestamp FROM paper_trades ORDER BY timestamp DESC LIMIT 1').get() as { timestamp: number } | undefined;
+        if (lastTradeRow) {
+            lastTradeTime = lastTradeRow.timestamp;
+        }
+
+        const pairs = getMonitoredPairs();
+        if (pairs && pairs.length > 0) {
+            monitoredSymbols = pairs;
+        }
+    } catch (err) {
+        log.warn({ err }, 'Error initializing bot state from database');
     }
 })();
 
-function persistState() {
+export function persistState() {
     const isHalted = Date.now() < lockoutUntil ? 1 : 0;
     updateBotStateStmt.run(capital, INITIAL_CAPITAL, isHalted, lockoutUntil, Date.now());
 }
@@ -334,6 +201,45 @@ function generateOrderId() {
     return 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+function recordDailyLoss(timestamp: number, amount: number) {
+    dailyLosses.push({ timestamp, amount });
+    RiskManager.recordDailyLoss(db, timestamp, amount);
+}
+
+export function getEffectiveMaxDrawdownPct(): number {
+    try {
+        const row = db.prepare('SELECT circuit_breaker_limit FROM bot_state WHERE id = 1').get() as any;
+        if (row && typeof row.circuit_breaker_limit === 'number' && row.circuit_breaker_limit > 0) {
+            return row.circuit_breaker_limit;
+        }
+    } catch {}
+    return config.risk.maxDrawdownPct;
+}
+
+function checkCircuitBreaker(timestamp: number): boolean {
+    const effectiveLimit = getEffectiveMaxDrawdownPct();
+    const status = RiskManager.checkCircuitBreaker(db, capital, timestamp, lockoutUntil, {
+        maxDrawdownPct: effectiveLimit,
+        lockoutMs: config.risk.lockoutMs,
+    });
+
+    if (status.isHalted) {
+        if (status.lockoutUntil !== lockoutUntil && status.lockoutUntil > Date.now()) {
+            lockoutUntil = status.lockoutUntil;
+            persistState();
+            notifyCircuitBreaker({
+                totalLoss: status.totalLoss24h,
+                capital,
+                lockoutUntil,
+                timestamp
+            }).catch(err => log.error({ err }, 'Discord alert error'));
+        }
+        return true;
+    }
+
+    return false;
+}
+
 function logTrade(
     symbol: string,
     side: string,
@@ -346,52 +252,82 @@ function logTrade(
     timestamp: number,
     direction: 'LONG' | 'SHORT' = 'LONG',
     executionMode: 'LIVE_FORWARD' | 'BACKTEST_MOCK' = 'LIVE_FORWARD',
-    broker: string = 'BYBIT'
+    broker: string = 'BYBIT',
+    setupType: SetupType = 'EMA_CROSSOVER',
+    signalPrice?: number,
+    fillPrice?: number,
+    slippage?: number,
+    fundingPnl: number = 0
 ) {
     const orderId = generateOrderId();
-    insertTradeStmt.run(orderId, symbol, side, type, price, amount, fee, pnl, pnlPercent, timestamp, direction, executionMode, broker);
+    const actualSignalPrice = signalPrice ?? price;
+    const actualFillPrice = fillPrice ?? price;
+    const actualSlippage = slippage ?? getSlippageForSymbol(symbol);
+    insertTradeStmt.run(
+        orderId, symbol, side, type, price, amount, fee, pnl, pnlPercent,
+        timestamp, direction, executionMode, broker, setupType,
+        actualSignalPrice, actualFillPrice, actualSlippage, fundingPnl
+    );
     const color = direction === 'LONG' ? C.GREEN : C.MAGENTA;
     const dirEmoji = direction === 'LONG' ? '🟢' : '🔴';
     const actionVerb = side === 'BUY' ? 'Bought' : 'Sold';
     const pnlStr = pnl !== 0 ? ` | Result: ${pnl > 0 ? '✅ Profit' : '❌ Loss'} $${Math.abs(pnl).toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)` : '';
-    console.log(`${color}${dirEmoji} ${actionVerb} ${symbol}${C.RESET} @ $${price.toFixed(2)} | Size: ${amount.toFixed(4)} | Fee: $${fee.toFixed(2)}${pnlStr} | Broker: ${broker}`);
+    const slipStr = actualSlippage > 0 ? ` | Slip: ${(actualSlippage * 100).toFixed(3)}%` : '';
+    const fundingStr = fundingPnl !== 0 ? ` | Funding: $${fundingPnl.toFixed(2)}` : '';
+    console.log(`${color}${dirEmoji} ${actionVerb} ${symbol}${C.RESET} @ $${price.toFixed(2)} | Size: ${amount.toFixed(4)} | Fee: $${fee.toFixed(2)}${pnlStr}${slipStr}${fundingStr} | Setup: ${setupType} | Broker: ${broker}`);
 }
 
-function checkCircuitBreaker(timestamp: number): boolean {
+// Periodic summary tracking
+let lastSummaryTime = Date.now();
+const SUMMARY_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+function maybePrintSummary() {
     const now = Date.now();
-    if (now < lockoutUntil || timestamp < lockoutUntil) {
-        return true; // Locked out
-    }
+    if (now - lastSummaryTime >= SUMMARY_INTERVAL) {
+        lastSummaryTime = now;
+        let totalUnrealized = 0;
+        let totalNotional = 0;
+        for (const p of positions.values()) {
+            const posRow = db.prepare("SELECT current_price FROM active_positions WHERE symbol = ? AND broker = 'BYBIT'").get(p.symbol) as { current_price: number } | undefined;
+            const curPrice = posRow ? posRow.current_price : p.entryPrice;
+            const notional = p.amount * curPrice;
+            totalNotional += notional;
+            const pnlCalc = StrategyEngine.calculatePnL(p.side, p.amount, p.entryPrice, curPrice, {
+                slippage: getSlippageForSymbol(p.symbol),
+                takerFee: TAKER_FEE,
+                accumulatedFunding: p.accumulatedFunding ?? 0
+            });
+            totalUnrealized += pnlCalc.unrealizedPnl;
+        }
 
-    // Clean old losses (> 24h rolling window) from memory and DB
-    const twentyFourHours = 24 * 60 * 60 * 1000;
-    dailyLosses = dailyLosses.filter(l => (timestamp - l.timestamp) <= twentyFourHours);
-    cleanOldLossesStmt.run(timestamp - twentyFourHours);
-    
-    const totalLoss = dailyLosses.reduce((sum, l) => sum + l.amount, 0);
-    if (totalLoss >= capital * 0.05) {
-        console.log(`\n${C.RED}${C.BOLD}🚨 EMERGENCY STOP — TRADING PAUSED FOR 24 HOURS${C.RESET}`);
-        console.log(`${C.RED}   Reason: Lost $${totalLoss.toFixed(2)} in the last 24 hours (over 5% of $${capital.toFixed(2)} balance).${C.RESET}`);
-        console.log(`${C.RED}   This is a safety feature to prevent further losses during a bad streak.${C.RESET}`);
-        console.log(`${C.RED}   Trading will resume automatically in 24 hours.${C.RESET}\n`);
-        lockoutUntil = timestamp + twentyFourHours;
-        persistState();
-        
-        // Dispatch emergency Discord Alert
-        notifyCircuitBreaker({
-            totalLoss,
-            capital,
-            lockoutUntil,
-            timestamp
-        }).catch(err => console.error("Discord alert error:", err));
-        return true;
+        const marginUsed = totalNotional / 10;
+        const availableBuyingPower = Math.max(0, capital - marginUsed);
+        const totalEquity = capital + totalUnrealized;
+        const pnlPct = ((totalEquity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100);
+        const pnlSign = pnlPct >= 0 ? '+' : '';
+        const unrealizedSign = totalUnrealized >= 0 ? '+' : '';
+        console.log(`\n${C.CYAN}${C.BOLD}⏰ 5-MIN STATUS UPDATE${C.RESET}`);
+        console.log(`${C.CYAN}───────────────────────────────────────────────────${C.RESET}`);
+        console.log(`   💰 Total Equity: $${totalEquity.toFixed(2)} (${pnlSign}${pnlPct.toFixed(2)}%) | Buying Power: $${availableBuyingPower.toFixed(2)}`);
+        console.log(`   📊 Watching: ${monitoredSymbols.length} coins (${monitoredSymbols.join(', ')})`);
+        console.log(`   📂 Open Trades: ${positions.size}/${config.watchlist.maxConcurrentPositions} (Margin: $${marginUsed.toFixed(2)}) | Unrealized: ${unrealizedSign}$${Math.abs(totalUnrealized).toFixed(2)}`);
+        if (positions.size > 0) {
+            for (const [sym, pos] of positions) {
+                const dirEmoji = pos.side === 'LONG' ? '🟢' : '🔴';
+                console.log(`       ${dirEmoji} ${sym} (${pos.side}) — Entry: $${pos.entryPrice.toFixed(2)} | Stop: $${pos.trailingStop.toFixed(2)}`);
+            }
+        }
+        const isLocked = Date.now() < lockoutUntil;
+        console.log(`   🛡️  Safety: ${isLocked ? '⛔ HALTED (circuit breaker active)' : '✅ Normal — all systems go'}`);
+        const { learnerLine, setupLine } = StrategyLearner.getStatusLines(db, positions.size, lastTradeTime, closestSetup);
+        console.log(learnerLine);
+        console.log(setupLine);
+        console.log(`${C.CYAN}───────────────────────────────────────────────────${C.RESET}\n`);
     }
-
-    return false;
 }
 
 /**
- * Normalizes symbol to Bybit's canonical CCXT linear perpetual futures symbol (e.g. BTC/USDT -> BTC/USDT:USDT).
+ * Normalizes symbol to Bybit's canonical CCXT linear perpetual futures symbol.
  */
 export function toExchangeSymbol(symbol: string): string {
     if (symbol.includes(':')) return symbol;
@@ -400,7 +336,90 @@ export function toExchangeSymbol(symbol: string): string {
 }
 
 /**
- * Safely fetches OHLCV data with sequential retry and exponential backoff for RateLimitExceeded (Bybit 10006).
+ * Singleton Bybit CCXT instance
+ */
+let singletonBybitExchange: any = null;
+export function getBybitExchange(): any {
+    if (!singletonBybitExchange) {
+        singletonBybitExchange = new ccxt.bybit({
+            hostname: config.exchange.bybitHostname,
+            options: { defaultType: 'future' },
+            timeout: 30000,
+            enableRateLimit: true
+        });
+    }
+    return singletonBybitExchange;
+}
+
+/**
+ * Detects CCXT BadSymbol or ExchangeError indicating unsupported/invalid market symbol.
+ */
+export function isBadSymbolError(err: any): boolean {
+    if (!err) return false;
+    if (err instanceof ccxt.BadSymbol || err?.name === 'BadSymbol') return true;
+    const msg = String(err?.message || err).toLowerCase();
+    return (
+        msg.includes('does not have market symbol') ||
+        msg.includes('symbol invalid') ||
+        msg.includes('symbol not supported') ||
+        msg.includes('unknown symbol')
+    );
+}
+
+/**
+ * Detects network connectivity drops, DNS failures (EAI_AGAIN / ENOTFOUND), timeouts, or ccxt.NetworkError.
+ */
+export function isNetworkError(err: any): boolean {
+    if (!err) return false;
+    if (err instanceof ccxt.NetworkError || err?.name === 'NetworkError' || (err?.constructor && err.constructor.prototype instanceof ccxt.NetworkError)) {
+        return true;
+    }
+    const code = err?.code || err?.cause?.code;
+    if (code && ['EAI_AGAIN', 'ENOTFOUND', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code)) {
+        return true;
+    }
+    const msg = (err?.message || '') + ' ' + (err?.cause?.message || '') + ' ' + String(err);
+    return (
+        msg.includes('EAI_AGAIN') ||
+        msg.includes('ENOTFOUND') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('ECONNREFUSED') ||
+        msg.includes('fetch failed') ||
+        msg.includes('getaddrinfo') ||
+        msg.toLowerCase().includes('network offline') ||
+        msg.toLowerCase().includes('network error')
+    );
+}
+
+/**
+ * Dynamically removes an invalid symbol from active memory, SQLite monitored_pairs, and JSON fallback.
+ */
+export function removeInvalidSymbol(symbol: string, reason: string) {
+    log.error({ symbol, reason }, `Removing invalid symbol from watchlist: ${symbol}`);
+    const normalized = symbol.replace(':USDT', '');
+    monitoredSymbols = monitoredSymbols.filter(s => s !== symbol && s !== normalized && s !== `${normalized}:USDT`);
+    try {
+        db.prepare('DELETE FROM monitored_pairs WHERE symbol = ? OR symbol = ?').run(symbol, `${normalized}:USDT`);
+    } catch (e) {
+        // ignore
+    }
+    try {
+        const jsonPath = path.resolve(process.cwd(), 'data/monitored_pairs.json');
+        if (fs.existsSync(jsonPath)) {
+            const data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+            if (Array.isArray(data)) {
+                const filtered = data.filter((item: any) => item.symbol !== symbol && item.normalizedSymbol !== normalized && item.symbol !== `${normalized}:USDT`);
+                fs.writeFileSync(jsonPath, JSON.stringify(filtered, null, 2));
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+/**
+ * Safely fetches OHLCV data with retry and exponential backoff for RateLimitExceeded.
  */
 export async function fetchOHLCVWithRetry(
     exchange: any,
@@ -410,22 +429,30 @@ export async function fetchOHLCVWithRetry(
     limit: number,
     maxRetries: number = 3
 ): Promise<any[]> {
-    let delay = 5000; // Start with 5-second backoff
+    let delay = 5000;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             return await exchange.fetchOHLCV(symbol, timeframe, since, limit);
         } catch (err: any) {
+            if (isBadSymbolError(err)) {
+                throw err;
+            }
+            if (isNetworkError(err)) {
+                if (attempt < maxRetries) {
+                    await new Promise((resolve) => setTimeout(resolve, 3000));
+                    continue;
+                }
+                throw err;
+            }
             const isRateLimit =
                 err instanceof ccxt.RateLimitExceeded ||
                 err?.name === 'RateLimitExceeded' ||
                 (err?.message && (err.message.includes('10006') || err.message.toLowerCase().includes('rate limit')));
 
             if (isRateLimit && attempt < maxRetries) {
-                console.warn(
-                    `${C.YELLOW}[RATE LIMIT EXCEEDED]${C.RESET} Bybit 10006 on ${symbol}. Waiting ${delay / 1000}s before retry (Attempt ${attempt}/${maxRetries})...`
-                );
+                log.warn({ symbol, attempt, maxRetries, delaySeconds: delay / 1000 }, 'Bybit rate limit exceeded. Backing off before retry...');
                 await new Promise((resolve) => setTimeout(resolve, delay));
-                delay *= 2; // Exponential backoff: 5s -> 10s -> 20s
+                delay *= 2;
             } else {
                 throw err;
             }
@@ -435,478 +462,579 @@ export async function fetchOHLCVWithRetry(
 }
 
 /**
- * Seeds historical candles via CCXT if symbol history is insufficient (< 150 bars).
+ * Ensures sufficient historical candles in SQLite for a symbol on the active timeframe.
+ * If candle count < 100, immediately fetches 200 historical candles from Bybit before evaluating.
+ */
+export async function ensureCandleHistory(
+    exchange: any,
+    symbol: string,
+    timeframe: string = TIMEFRAME,
+    minCount: number = 100
+): Promise<boolean> {
+    try {
+        const countRow = db.prepare('SELECT count(*) as c FROM candles WHERE symbol = ? AND timeframe = ?').get(symbol, timeframe) as { c: number } | undefined;
+        const currentCount = countRow ? countRow.c : 0;
+        if (currentCount < minCount) {
+            log.info({ symbol, currentCount, target: 200, timeframe }, `Candle count (${currentCount}) < ${minCount}. Seeding 200 historical candles from Bybit...`);
+            const marketSymbol = toExchangeSymbol(symbol);
+            const ohlcv = await fetchOHLCVWithRetry(exchange, marketSymbol, timeframe, undefined, 200);
+            if (ohlcv && ohlcv.length > 0) {
+                const insertMany = db.transaction((candlesArr: any[]) => {
+                    for (const c of candlesArr) {
+                        upsertCandleStmt.run(symbol, timeframe, c[0], c[1], c[2], c[3], c[4], c[5]);
+                    }
+                });
+                insertMany(ohlcv);
+                log.info({ symbol, count: ohlcv.length, timeframe }, 'Successfully seeded historical candles');
+                return true;
+            }
+        }
+        return true;
+    } catch (err: any) {
+        if (isBadSymbolError(err)) {
+            removeInvalidSymbol(symbol, err?.message || 'Invalid symbol on exchange');
+            return false;
+        }
+        if (isNetworkError(err)) {
+            throw err;
+        }
+        log.error({ err, symbol, timeframe }, 'Error ensuring candle history');
+        return false;
+    }
+}
+
+/**
+ * Seeds historical candles via CCXT if symbol history is insufficient (< 100 bars).
  */
 export async function seedHistoryIfNeeded(exchange: any) {
-    for (const symbol of monitoredSymbols) {
-        const countRow = db.prepare('SELECT count(*) as c FROM candles WHERE symbol = ? AND timeframe = ?').get(symbol, TIMEFRAME) as { c: number };
-        if (!countRow || countRow.c < 150) {
-            console.log(`${C.CYAN}[SEEDING HISTORY]${C.RESET} Fetching 200 historical candles for ${symbol}...`);
+    try {
+        for (const symbol of [...monitoredSymbols]) {
             try {
-                const marketSymbol = toExchangeSymbol(symbol);
-                const ohlcv = await fetchOHLCVWithRetry(exchange, marketSymbol, TIMEFRAME, undefined, 200);
-                if (ohlcv && ohlcv.length > 0) {
-                    const insertMany = db.transaction((candlesArr: any[]) => {
-                        for (const c of candlesArr) {
-                            upsertCandleStmt.run(symbol, TIMEFRAME, c[0], c[1], c[2], c[3], c[4], c[5] || 0);
-                        }
-                    });
-                    insertMany(ohlcv);
-                    console.log(`${C.GREEN}[SEEDING COMPLETE]${C.RESET} Loaded ${ohlcv.length} candles for ${symbol}.`);
+                await ensureCandleHistory(exchange, symbol, TIMEFRAME, 100);
+            } catch (err: any) {
+                if (isBadSymbolError(err)) {
+                    removeInvalidSymbol(symbol, err?.message || 'Invalid symbol on exchange');
+                } else if (isNetworkError(err)) {
+                    throw err;
                 }
-            } catch (err) {
-                console.error(`Failed to seed candles for ${symbol}:`, err);
             }
-            // 200ms delay between pair fetches
-            await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+    } catch (err: any) {
+        if (isNetworkError(err)) {
+            console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+            await new Promise(r => setTimeout(r, 10000));
+        } else {
+            log.error({ err }, 'Error during seedHistoryIfNeeded');
         }
     }
 }
 
 /**
- * Processes price ticks (either newly closed candles or incoming incomplete bar updates).
- * Evaluates bidirectional (Long & Short) entry and exit rules.
+ * Evaluates market tick for a single pair using centralized StrategyEngine and RiskManager.
  */
 export async function processTick(
     symbol: string,
     timeframe: string,
     candle: [number, number, number, number, number, number],
-    isClosed: boolean
+    isClosed: boolean,
+    isPaused: boolean = false
 ) {
     const [timestamp, open, high, low, close, volume] = candle;
-    const isHalted = checkCircuitBreaker(timestamp);
-
-    // Persist candle update
     upsertCandleStmt.run(symbol, timeframe, timestamp, open, high, low, close, volume);
 
-    // Load recent history (150 candles) for numerical indicator warm-up
+    const isHalted = checkCircuitBreaker(timestamp);
+
     const rows = db.prepare(`
-        SELECT open, high, low, close FROM candles 
-        WHERE symbol = ? AND timeframe = ? 
-        ORDER BY timestamp DESC LIMIT 150
-    `).all(symbol, timeframe) as { open: number, high: number, low: number, close: number }[];
+        SELECT timestamp, open, high, low, close, volume
+        FROM candles
+        WHERE symbol = ? AND timeframe = ?
+        ORDER BY timestamp DESC
+        LIMIT 100
+    `).all(symbol, timeframe) as CandleData[];
 
     if (rows.length < 50) {
+        log.warn(
+            { symbol, count: rows.length, timeframe },
+            `⚠️ Skipping analysis line: Insufficient candle history in database (${rows.length} < 50 required for indicators)`
+        );
+        return;
+    }
+    const history = rows.reverse();
+
+    const snapshot = StrategyEngine.getLatestSnapshot(history);
+    if (!snapshot) return;
+
+    const currentCandleObj: CandleData = { timestamp, open, high, low, close, volume };
+
+    // Evaluate entry setups and proximity reasoning with Cold-Start Exploration status
+    const isExplore = StrategyLearner.getLearnerMode(positions.size, lastTradeTime) === 'EXPLORE';
+    const allowIntrabar = config.app.allowIntrabarSignals;
+    const signalEval = StrategyEngine.evaluateEntry(history, undefined, {
+        isClosed,
+        allowShorts: true,
+        allowIntrabar,
+        isExploreMode: isExplore
+    });
+
+    // Track closest setup and near-miss counterfactual shadow trades
+    if (signalEval.nearMiss) {
+        if (!closestSetup || signalEval.nearMiss.readinessPct >= closestSetup.readinessPct) {
+            closestSetup = {
+                symbol,
+                playbook: signalEval.nearMiss.playbook,
+                readinessPct: signalEval.nearMiss.readinessPct,
+                statusText: signalEval.nearMiss.message,
+            };
+        }
+        if (isClosed) {
+            StrategyLearner.recordShadowTrade(db, {
+                symbol,
+                playbook: signalEval.nearMiss.playbook,
+                direction: signalEval.nearMiss.direction,
+                rejected_filter: signalEval.nearMiss.rejectedFilter,
+                filter_value: signalEval.nearMiss.filterValue,
+                filter_threshold: signalEval.nearMiss.filterThreshold,
+                entry_price: signalEval.nearMiss.entryPrice,
+                atr: signalEval.nearMiss.atr,
+                timestamp,
+            });
+        }
+    }
+
+    // Upsert live monitored market state for dashboard display
+    const change24h = history.length > 0 && history[0].close > 0
+        ? ((close - history[0].close) / history[0].close) * 100
+        : 0;
+
+    const isCore = config.watchlist.pinnedCorePairs.includes(symbol);
+    const tier = isCore ? 'CORE' : 'SATELLITE';
+
+    upsertMonitoredMarketState({
+        symbol,
+        price: close,
+        change_24h: change24h,
+        ema20: snapshot.currentEmaFast,
+        ema50: snapshot.currentEmaSlow,
+        rsi14: snapshot.currentRsi,
+        adx14: snapshot.currentAdx,
+        signal_proximity: signalEval.signalProximity || 'Evaluating market condition',
+        updated_at: timestamp,
+        tier
+    });
+
+    // 1. POSITION MANAGEMENT & DYNAMIC TRAILING STOP
+    if (positions.has(symbol)) {
+        const pos = positions.get(symbol)!;
+
+        // Accrue funding payments every fundingIntervalHours (default 8h)
+        const fundingIntervalMs = (config.exchange.fundingIntervalHours || 8) * 3600 * 1000;
+        const defaultFundingRate = config.exchange.defaultFundingRate || 0.0001;
+        if (!pos.lastFundingTime) pos.lastFundingTime = pos.entryTime;
+        if (pos.accumulatedFunding === undefined) pos.accumulatedFunding = 0;
+        const elapsedFundingPeriods = Math.floor((timestamp - pos.lastFundingTime) / fundingIntervalMs);
+        if (elapsedFundingPeriods > 0) {
+            const notional = pos.amount * close;
+            const periodFunding = elapsedFundingPeriods * notional * defaultFundingRate;
+            const fundingDelta = pos.side === 'LONG' ? -periodFunding : periodFunding;
+            pos.accumulatedFunding += fundingDelta;
+            pos.lastFundingTime += elapsedFundingPeriods * fundingIntervalMs;
+        }
+
+        const pairSlippage = getSlippageForSymbol(symbol);
+
+        // Intrabar stop guardrail: if intrabar stops disabled and bar is not closed, skip exit evaluation
+        const allowStopEvaluation = isClosed || config.app.allowIntrabarStops;
+        if (!allowStopEvaluation) {
+            return null;
+        }
+
+        const exitEval = StrategyEngine.evaluateExit(
+            {
+                symbol: pos.symbol,
+                side: pos.side,
+                amount: pos.amount,
+                entryPrice: pos.entryPrice,
+                currentPrice: close,
+                highestPrice: pos.highestPrice,
+                lowestPrice: pos.lowestPrice,
+                trailingStop: pos.trailingStop,
+                atr: pos.atr,
+                entryTime: pos.entryTime,
+                takeProfitPrice: pos.takeProfitPrice,
+                setupType: pos.setupType,
+            },
+            currentCandleObj,
+            snapshot,
+            isClosed,
+            { atrMultiplier: (pos.setupType === 'EXTREME_RSI_REVERSAL' ? 1.2 : ATR_MULTIPLIER), slippage: pairSlippage }
+        );
+
+        pos.trailingStop = exitEval.newTrailingStop;
+        pos.highestPrice = exitEval.newHighestPrice;
+        pos.lowestPrice = exitEval.newLowestPrice;
+
+        const pnlCalc = StrategyEngine.calculatePnL(pos.side, pos.amount, pos.entryPrice, close, {
+            slippage: pairSlippage,
+            takerFee: TAKER_FEE,
+            accumulatedFunding: pos.accumulatedFunding
+        });
+
+        upsertActivePosStmt.run(
+            pos.symbol,
+            'BYBIT',
+            pos.side,
+            pos.amount,
+            pos.entryPrice,
+            close,
+            pos.highestPrice,
+            pos.lowestPrice,
+            pos.trailingStop,
+            pos.atr,
+            pnlCalc.unrealizedPnl,
+            pnlCalc.unrealizedPnlPercent,
+            pos.entryTime,
+            timestamp,
+            pos.setupType || 'EMA_CROSSOVER',
+            pos.signalPrice ?? pos.entryPrice,
+            pos.accumulatedFunding ?? 0
+        );
+
+        if (exitEval.shouldExit && exitEval.reason) {
+            const rawSignalPrice = exitEval.reason === 'EMA_CROSS'
+                ? close
+                : (exitEval.reason === 'TAKE_PROFIT' ? pos.takeProfitPrice! : exitEval.newTrailingStop);
+            const executionPrice = exitEval.executionPrice;
+            const realized = StrategyEngine.calculatePnL(
+                pos.side,
+                pos.amount,
+                pos.entryPrice,
+                executionPrice,
+                { slippage: 0, takerFee: TAKER_FEE, accumulatedFunding: pos.accumulatedFunding }
+            );
+
+            if (realized.netRealizedPnl < 0) {
+                recordDailyLoss(timestamp, Math.abs(realized.netRealizedPnl));
+            }
+
+            // Realized PnL directly updates capital balance
+            capital += realized.netRealizedPnl;
+
+            logTrade(
+                symbol,
+                pos.side === 'LONG' ? 'SELL' : 'BUY',
+                exitEval.reason,
+                executionPrice,
+                pos.amount,
+                realized.fee,
+                realized.netRealizedPnl,
+                realized.netRealizedPnlPercent,
+                timestamp,
+                pos.side,
+                'LIVE_FORWARD',
+                'BYBIT',
+                pos.setupType || 'EMA_CROSSOVER',
+                rawSignalPrice,
+                executionPrice,
+                pairSlippage,
+                pos.accumulatedFunding ?? 0
+            );
+
+            lastTradeClosedTime[symbol] = timestamp;
+            lastTradeTime = timestamp;
+
+            // Recalculate rolling Win Rate and Expectancy for this setup_type and adapt risk
+            try {
+                const closedTrade = {
+                    setupType: pos.setupType || 'EMA_CROSSOVER',
+                    symbol: pos.symbol,
+                    pnl: realized.netRealizedPnl,
+                    pnlPercent: realized.netRealizedPnlPercent,
+                    entryPrice: pos.entryPrice,
+                    exitPrice: executionPrice,
+                    amount: pos.amount,
+                    entryTime: pos.entryTime,
+                    exitTime: timestamp,
+                };
+                const adaptation = RiskManager.recordClosedTradeAndAdapt(db, closedTrade);
+                if (adaptation.adjusted) {
+                    logActivity('STATE_CHANGE', adaptation.message, 'Adaptive risk scaling engine', db);
+                    console.log(`${C.YELLOW}🧠 ${adaptation.message}${C.RESET}`);
+                }
+
+                // Update Persistent Multi-Armed Bandit / Expectancy Learner
+                const posTier = config.watchlist.pinnedCorePairs.includes(pos.symbol) ? 'CORE' : 'SATELLITE';
+                const posRegime = StrategyLearner.detectVolatilityRegime(pos.atr, executionPrice, snapshot.currentAdx);
+                const rMultiple = pos.atr > 0 ? realized.netRealizedPnl / (pos.atr * pos.amount) : 0;
+                StrategyLearner.recordTradeOutcome(db, {
+                    playbook: pos.setupType || 'EMA_CROSSOVER',
+                    symbolTier: posTier,
+                    volatilityRegime: posRegime,
+                    netPnl: realized.netRealizedPnl,
+                    rMultiple
+                });
+            } catch (adaptErr) {
+                log.error({ adaptErr }, 'Error recording closed trade adaptation');
+            }
+
+            positions.delete(symbol);
+            deleteActivePosStmt.run(symbol);
+            persistState();
+
+            notifyPositionClosed({
+                symbol,
+                exitPrice: executionPrice,
+                pnl: realized.netRealizedPnl,
+                pnlPercent: realized.netRealizedPnlPercent,
+                reason: `${exitEval.reason} (${pos.side})`,
+                durationMs: timestamp - pos.entryTime,
+                timestamp
+            }).catch(err => log.error({ err }, 'Discord alert error'));
+
+            checkCircuitBreaker(timestamp);
+            return null;
+        }
+        return null;
+    }
+
+    // 2. BIDIRECTIONAL ENTRY CONDITIONS (Evaluated on Closed Candles or Intrabar when NOT paused)
+    const shouldEvaluateEntry = (isClosed || allowIntrabar) && !isPaused;
+    if (shouldEvaluateEntry) {
+        console.log(
+            `${C.DIM}📊 ${symbol}${C.RESET} $${close.toFixed(2)} | ` +
+            `Market: ${signalEval.trendStatus === 'trending' ? C.GREEN + '✅ Trending' + C.RESET : C.RED + '❌ Choppy' + C.RESET} (ADX ${snapshot.currentAdx.toFixed(0)}) | ` +
+            `Direction: ${signalEval.trendWord} | ` +
+            `Momentum: ${signalEval.momentumWord} (RSI ${snapshot.currentRsi.toFixed(0)}) | ` +
+            `Setup: ${signalEval.setupType}`
+        );
+
+        const cooldownMs = 15 * 60 * 1000; // 15 min per-symbol cooldown
+        const isCooldown = lastTradeClosedTime[symbol] && (timestamp - lastTradeClosedTime[symbol] < cooldownMs);
+
+        if (!positions.has(symbol) && !isHalted && !isCooldown && signalEval.isEntry && signalEval.direction) {
+            const side = signalEval.direction;
+            const isCorePair = config.watchlist.pinnedCorePairs.includes(symbol);
+            const pairTier: 'CORE' | 'SATELLITE' = isCorePair ? 'CORE' : 'SATELLITE';
+            const volRegime = StrategyLearner.detectVolatilityRegime(snapshot.currentAtr, close, snapshot.currentAdx);
+            const banditWeight = StrategyLearner.getConfidenceWeight(db, signalEval.setupType || 'EMA_CROSSOVER', pairTier, volRegime);
+
+            return {
+                symbol,
+                side,
+                adx: snapshot.currentAdx,
+                learnerWeight: banditWeight,
+                compositeScore: snapshot.currentAdx * banditWeight,
+                signalEval,
+                snapshot,
+                close,
+                timestamp,
+                pairTier,
+                volRegime
+            };
+        }
+    }
+    return null;
+}
+
+/**
+ * Signal candidate structure for signal quality ranking across the watchlist universe.
+ */
+export interface PendingSignal {
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    adx: number;
+    learnerWeight: number;
+    compositeScore: number;
+    signalEval: any;
+    snapshot: any;
+    close: number;
+    timestamp: number;
+    pairTier: 'CORE' | 'SATELLITE';
+    volRegime: string;
+}
+
+/**
+ * Executes a prioritized entry setup with leverage-based margin allocation.
+ */
+export async function executeEntry(sig: PendingSignal) {
+    if (config.app.strategyPaused) {
+        log.warn({ symbol: sig.symbol, side: sig.side }, '15m strategy execution strictly blocked: STRATEGY_PAUSED is enforced in code');
         return;
     }
 
-    // Reverse to chronological order (oldest to newest)
-    const history = rows.reverse();
-    const highs = history.map(c => c.high);
-    const lows = history.map(c => c.low);
-    const closes = history.map(c => c.close);
+    const { symbol, side, signalEval, snapshot, close, timestamp, pairTier, volRegime, learnerWeight } = sig;
 
-    // Compute technical indicators
-    const ema20Arr = EMA.calculate({ period: 20, values: closes });
-    const ema50Arr = EMA.calculate({ period: 50, values: closes });
-    const rsi14Arr = RSI.calculate({ period: 14, values: closes });
-    const adx14Arr = ADX.calculate({ period: 14, high: highs, low: lows, close: closes });
-    const atr14Arr = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
+    if (positions.has(symbol)) return;
 
-    const currentEma20 = ema20Arr[ema20Arr.length - 1];
-    const previousEma20 = ema20Arr[ema20Arr.length - 2];
-    const currentEma50 = ema50Arr[ema50Arr.length - 1];
-    const previousEma50 = ema50Arr[ema50Arr.length - 2];
-    const currentRsi = rsi14Arr[rsi14Arr.length - 1];
-    const currentAdx = adx14Arr[adx14Arr.length - 1]?.adx ?? 0;
-    const currentAtr = atr14Arr[atr14Arr.length - 1] ?? 0;
-
-    // -------------------------------------------------------------
-    // 1. BIDIRECTIONAL POSITION MANAGEMENT & ATR TRAILING STOP-LOSS
-    // -------------------------------------------------------------
-    if (positions.has(symbol)) {
-        const pos = positions.get(symbol)!;
-        const effectiveAtr = currentAtr > 0 ? currentAtr : pos.atr;
-
-        if (pos.side === 'LONG') {
-            // LONG TRAILING STOP: Ratchets UP based on new recent highs
-            if (high > pos.highestPrice) {
-                pos.highestPrice = high;
-                const proposedStop = pos.highestPrice - (ATR_MULTIPLIER * effectiveAtr);
-                if (proposedStop > pos.trailingStop) {
-                    pos.trailingStop = proposedStop;
-                    console.log(`${C.CYAN}🔒 Safety stop raised:${C.RESET} ${symbol} hit new high ($${pos.highestPrice.toFixed(2)}), auto-exit price moved up to $${pos.trailingStop.toFixed(2)} to lock in more profit`);
-                }
-            }
-
-            // Live unrealized PnL calculation (Long)
-            const unrealizedPnl = (pos.amount * close * (1 - SLIPPAGE) * (1 - TAKER_FEE)) - (pos.amount * pos.entryPrice);
-            const unrealizedPnlPct = (unrealizedPnl / (pos.amount * pos.entryPrice)) * 100;
-
-            // Sync with SQLite active_positions table
-            upsertActivePosStmt.run(
-                pos.symbol,
-                pos.side,
-                pos.amount,
-                pos.entryPrice,
-                close,
-                pos.highestPrice,
-                pos.lowestPrice,
-                pos.trailingStop,
-                pos.atr,
-                unrealizedPnl,
-                unrealizedPnlPct,
-                pos.entryTime,
-                timestamp,
-                'BYBIT'
-            );
-
-            // Check if Long Trailing Stop is breached
-            if (low <= pos.trailingStop) {
-                const executionPrice = pos.trailingStop * (1 - SLIPPAGE);
-                const grossValue = pos.amount * executionPrice;
-                const fee = grossValue * TAKER_FEE;
-                const netValue = grossValue - fee;
-                const pnl = netValue - (pos.amount * pos.entryPrice);
-                const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                console.log(`${C.YELLOW}⚡ Auto-exit triggered:${C.RESET} ${symbol} price ($${low.toFixed(2)}) dropped below safety stop ($${pos.trailingStop.toFixed(2)}) — closing to protect capital`);
-                
-                if (pnl < 0) {
-                    recordDailyLoss(timestamp, Math.abs(pnl));
-                }
-                capital += netValue;
-                logTrade(symbol, 'SELL', 'TRAILING_STOP', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
-                
-                positions.delete(symbol);
-                deleteActivePosStmt.run(symbol);
-                persistState();
-
-                notifyPositionClosed({
-                    symbol,
-                    exitPrice: executionPrice,
-                    pnl,
-                    pnlPercent,
-                    reason: 'TRAILING_STOP (LONG)',
-                    durationMs: timestamp - pos.entryTime,
-                    timestamp
-                }).catch(err => console.error("Discord alert error:", err));
-
-                checkCircuitBreaker(timestamp);
-                return;
-            }
-
-            // Check Long Strategy Exit on closed candle (20 EMA crosses below 50 EMA)
-            if (isClosed) {
-                const crossedBelow = previousEma20 >= previousEma50 && currentEma20 < currentEma50;
-                if (crossedBelow) {
-                    console.log(`${C.YELLOW}📉 Trend reversed:${C.RESET} ${symbol} short-term trend crossed below long-term trend — exiting long position`);
-                    const executionPrice = close * (1 - SLIPPAGE);
-                    const grossValue = pos.amount * executionPrice;
-                    const fee = grossValue * TAKER_FEE;
-                    const netValue = grossValue - fee;
-                    const pnl = netValue - (pos.amount * pos.entryPrice);
-                    const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                    if (pnl < 0) {
-                        recordDailyLoss(timestamp, Math.abs(pnl));
-                    }
-                    capital += netValue;
-                    logTrade(symbol, 'SELL', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'LONG', 'LIVE_FORWARD');
-
-                    positions.delete(symbol);
-                    deleteActivePosStmt.run(symbol);
-                    persistState();
-
-                    notifyPositionClosed({
-                        symbol,
-                        exitPrice: executionPrice,
-                        pnl,
-                        pnlPercent,
-                        reason: 'EMA_CROSS (LONG)',
-                        durationMs: timestamp - pos.entryTime,
-                        timestamp
-                    }).catch(err => console.error("Discord alert error:", err));
-
-                    checkCircuitBreaker(timestamp);
-                    return;
-                }
-            }
-        } else if (pos.side === 'SHORT') {
-            // SHORT TRAILING STOP: Ratchets DOWN based on new recent lows
-            if (low < pos.lowestPrice) {
-                pos.lowestPrice = low;
-                const proposedStop = pos.lowestPrice + (ATR_MULTIPLIER * effectiveAtr);
-                if (proposedStop < pos.trailingStop) {
-                    pos.trailingStop = proposedStop;
-                    console.log(`${C.CYAN}🔒 Safety stop lowered:${C.RESET} ${symbol} hit new low ($${pos.lowestPrice.toFixed(2)}), auto-exit price moved down to $${pos.trailingStop.toFixed(2)} to lock in short profit`);
-                }
-            }
-
-            // Live unrealized PnL calculation (Short: profit when current price is below entry)
-            const coverCost = pos.amount * close * (1 + SLIPPAGE) * (1 + TAKER_FEE);
-            const unrealizedPnl = (pos.amount * pos.entryPrice) - coverCost;
-            const unrealizedPnlPct = (unrealizedPnl / (pos.amount * pos.entryPrice)) * 100;
-
-            upsertActivePosStmt.run(
-                pos.symbol,
-                pos.side,
-                pos.amount,
-                pos.entryPrice,
-                close,
-                pos.highestPrice,
-                pos.lowestPrice,
-                pos.trailingStop,
-                pos.atr,
-                unrealizedPnl,
-                unrealizedPnlPct,
-                pos.entryTime,
-                timestamp,
-                'BYBIT'
-            );
-
-            // Check if Short Trailing Stop is breached (high rises through stop)
-            if (high >= pos.trailingStop) {
-                const executionPrice = pos.trailingStop * (1 + SLIPPAGE);
-                const grossCost = pos.amount * executionPrice;
-                const fee = grossCost * TAKER_FEE;
-                const pnl = (pos.amount * pos.entryPrice) - grossCost - fee;
-                const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                console.log(`${C.YELLOW}⚡ Auto-exit triggered:${C.RESET} ${symbol} price ($${high.toFixed(2)}) rose above safety stop ($${pos.trailingStop.toFixed(2)}) — closing short to protect capital`);
-                
-                if (pnl < 0) {
-                    recordDailyLoss(timestamp, Math.abs(pnl));
-                }
-                // Return original collateral plus realized PnL
-                capital += (pos.amount * pos.entryPrice) + pnl;
-                logTrade(symbol, 'BUY', 'TRAILING_STOP', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'SHORT', 'LIVE_FORWARD');
-                
-                positions.delete(symbol);
-                deleteActivePosStmt.run(symbol);
-                persistState();
-
-                notifyPositionClosed({
-                    symbol,
-                    exitPrice: executionPrice,
-                    pnl,
-                    pnlPercent,
-                    reason: 'TRAILING_STOP (SHORT)',
-                    durationMs: timestamp - pos.entryTime,
-                    timestamp
-                }).catch(err => console.error("Discord alert error:", err));
-
-                checkCircuitBreaker(timestamp);
-                return;
-            }
-
-            // Check Short Strategy Exit on closed candle (20 EMA crosses above 50 EMA)
-            if (isClosed) {
-                const crossedAbove = previousEma20 <= previousEma50 && currentEma20 > currentEma50;
-                if (crossedAbove) {
-                    console.log(`${C.YELLOW}📈 Trend reversed:${C.RESET} ${symbol} short-term trend crossed above long-term trend — exiting short position`);
-                    const executionPrice = close * (1 + SLIPPAGE);
-                    const grossCost = pos.amount * executionPrice;
-                    const fee = grossCost * TAKER_FEE;
-                    const pnl = (pos.amount * pos.entryPrice) - grossCost - fee;
-                    const pnlPercent = (pnl / (pos.amount * pos.entryPrice)) * 100;
-
-                    if (pnl < 0) {
-                        recordDailyLoss(timestamp, Math.abs(pnl));
-                    }
-                    capital += (pos.amount * pos.entryPrice) + pnl;
-                    logTrade(symbol, 'BUY', 'EMA_CROSS', executionPrice, pos.amount, fee, pnl, pnlPercent, timestamp, 'SHORT', 'LIVE_FORWARD');
-
-                    positions.delete(symbol);
-                    deleteActivePosStmt.run(symbol);
-                    persistState();
-
-                    notifyPositionClosed({
-                        symbol,
-                        exitPrice: executionPrice,
-                        pnl,
-                        pnlPercent,
-                        reason: 'EMA_CROSS (SHORT)',
-                        durationMs: timestamp - pos.entryTime,
-                        timestamp
-                    }).catch(err => console.error("Discord alert error:", err));
-
-                    checkCircuitBreaker(timestamp);
-                    return;
-                }
-            }
-        }
+    // Portfolio Heat Guard: Max Concurrent Positions
+    const maxConcurrent = config.watchlist.maxConcurrentPositions;
+    if (positions.size >= maxConcurrent) {
+        const msg = `Signal skipped: Max concurrent positions (${maxConcurrent}) reached`;
+        log.warn({ symbol, side, openPositions: positions.size, maxConcurrent }, msg);
+        logActivity('ALERT', msg, `${symbol} ${side} entry prevented by portfolio heat guardrail`, db);
+        return;
     }
 
-    // -------------------------------------------------------------
-    // 2. BIDIRECTIONAL ENTRY CONDITIONS (Evaluated on Closed Candles)
-    // -------------------------------------------------------------
-    if (isClosed) {
-        const adxPassed = currentAdx > 25;
-        const longRsiPassed = currentRsi >= 40 && currentRsi <= 65;
-        const shortRsiPassed = currentRsi >= 35 && currentRsi <= 60;
-        const longEmaCross = previousEma20 <= previousEma50 && currentEma20 > currentEma50;
-        const shortEmaCross = previousEma20 >= previousEma50 && currentEma20 < currentEma50;
-
-        // Human-readable market status
-        const trendStatus = adxPassed ? `${C.GREEN}✅ Trending${C.RESET}` : `${C.RED}❌ Choppy/Sideways${C.RESET}`;
-        const trendWord = currentEma20 > currentEma50 ? 'upward' : 'downward';
-        const momentumWord = currentRsi > 60 ? 'overbought (risky to buy)' : currentRsi < 40 ? 'oversold (risky to sell)' : 'healthy';
-        
-        console.log(
-            `${C.DIM}📊 ${symbol}${C.RESET} $${close.toFixed(2)} | ` +
-            `Market: ${trendStatus} (ADX ${currentAdx.toFixed(0)}) | ` +
-            `Direction: ${trendWord} | ` +
-            `Momentum: ${momentumWord} (RSI ${currentRsi.toFixed(0)})`
-        );
-
-        if (!positions.has(symbol) && !isHalted) {
-            // A. LONG ENTRY: 20 EMA > 50 EMA AND RSI 40-65 AND ADX > 25
-            if (longEmaCross && longRsiPassed && adxPassed) {
-                console.log(`\n${C.GREEN}${C.BOLD}🟢 BUYING ${symbol}${C.RESET} — All 3 conditions met:`);
-                console.log(`   ✅ Market trending strongly (ADX ${currentAdx.toFixed(0)} > 25)`);
-                console.log(`   ✅ Momentum is safe to enter (RSI ${currentRsi.toFixed(0)} in 40-65 range)`);
-                console.log(`   ✅ Uptrend just started (fast average crossed above slow average)`);
-                
-                const executionPrice = close * (1 + SLIPPAGE);
-                const stopDistance = ATR_MULTIPLIER * currentAtr;
-                const initialTrailingStop = executionPrice - stopDistance;
-
-                // Position sizing: Risk strictly 2% of portfolio per position
-                const riskAmount = capital * MAX_RISK_PCT;
-                const maxPositionSize = stopDistance > 0 ? riskAmount / stopDistance : 0;
-                const maxAffordableSize = (capital * (1 - TAKER_FEE)) / executionPrice;
-                const positionSize = Math.min(maxPositionSize, maxAffordableSize);
-
-                if (positionSize <= 0) {
-                    console.log(`${C.RED}⚠️  Cannot buy ${symbol}${C.RESET} — calculated position size is too small`);
-                    return;
-                }
-
-                // Critical: Verify sufficient capital before entry
-                const totalCost = (positionSize * executionPrice) + (positionSize * executionPrice * TAKER_FEE);
-                if (totalCost > capital) {
-                    console.log(`${C.RED}⚠️  Cannot buy ${symbol}${C.RESET} — not enough capital ($${capital.toFixed(2)} available, $${totalCost.toFixed(2)} needed)`);
-                    return;
-                }
-
-                const cost = positionSize * executionPrice;
-                const fee = cost * TAKER_FEE;
-
-                capital -= (cost + fee);
-                const newPos: Position = {
-                    symbol,
-                    side: 'LONG',
-                    amount: positionSize,
-                    entryPrice: executionPrice,
-                    highestPrice: executionPrice,
-                    lowestPrice: executionPrice,
-                    trailingStop: initialTrailingStop,
-                    entryTime: timestamp,
-                    atr: currentAtr
-                };
-                positions.set(symbol, newPos);
-
-                logTrade(symbol, 'BUY', 'ENTRY', executionPrice, positionSize, fee, 0, 0, timestamp, 'LONG', 'LIVE_FORWARD');
-                upsertActivePosStmt.run(
-                    symbol,
-                    'LONG',
-                    positionSize,
-                    executionPrice,
-                    executionPrice,
-                    executionPrice,
-                    executionPrice,
-                    initialTrailingStop,
-                    currentAtr,
-                    0,
-                    0,
-                    timestamp,
-                    timestamp,
-                    'BYBIT'
-                );
-                persistState();
-
-                notifyOrderEntered({
-                    symbol,
-                    entryPrice: executionPrice,
-                    amount: positionSize,
-                    initialStop: initialTrailingStop,
-                    atr: currentAtr,
-                    timestamp,
-                    direction: 'LONG'
-                }).catch(err => console.error("Discord alert error:", err));
-
-                console.log(`${C.BLUE}   💰 Position opened:${C.RESET} Size: ${positionSize.toFixed(4)} | Safety stop at: $${initialTrailingStop.toFixed(2)} | Remaining balance: $${capital.toFixed(2)}`);
-            }
-            // B. SHORT ENTRY: 20 EMA < 50 EMA AND RSI 35-60 AND ADX > 25
-            else if (shortEmaCross && shortRsiPassed && adxPassed) {
-                console.log(`\n${C.MAGENTA}${C.BOLD}🔴 SHORTING ${symbol}${C.RESET} — All 3 conditions met:`);
-                console.log(`   ✅ Market trending strongly (ADX ${currentAdx.toFixed(0)} > 25)`);
-                console.log(`   ✅ Momentum is safe to short (RSI ${currentRsi.toFixed(0)} in 35-60 range)`);
-                console.log(`   ✅ Downtrend just started (fast average crossed below slow average)`);
-                
-                const executionPrice = close * (1 - SLIPPAGE);
-                const stopDistance = ATR_MULTIPLIER * currentAtr;
-                const initialTrailingStop = executionPrice + stopDistance; // Stop placed above for short
-
-                // Position sizing: Risk strictly 2% of portfolio per position
-                const riskAmount = capital * MAX_RISK_PCT;
-                const maxPositionSize = stopDistance > 0 ? riskAmount / stopDistance : 0;
-                const maxAffordableSize = (capital * (1 - TAKER_FEE)) / executionPrice;
-                const positionSize = Math.min(maxPositionSize, maxAffordableSize);
-
-                if (positionSize <= 0) {
-                    console.log(`${C.RED}⚠️  Cannot short ${symbol}${C.RESET} — calculated position size is too small`);
-                    return;
-                }
-
-                // Critical: Verify sufficient capital before entry
-                const totalMargin = (positionSize * executionPrice) + (positionSize * executionPrice * TAKER_FEE);
-                if (totalMargin > capital) {
-                    console.log(`${C.RED}⚠️  Cannot short ${symbol}${C.RESET} — not enough capital ($${capital.toFixed(2)} available, $${totalMargin.toFixed(2)} needed)`);
-                    return;
-                }
-
-                const margin = positionSize * executionPrice;
-                const fee = margin * TAKER_FEE;
-
-                capital -= (margin + fee);
-                const newPos: Position = {
-                    symbol,
-                    side: 'SHORT',
-                    amount: positionSize,
-                    entryPrice: executionPrice,
-                    highestPrice: executionPrice,
-                    lowestPrice: executionPrice,
-                    trailingStop: initialTrailingStop,
-                    entryTime: timestamp,
-                    atr: currentAtr
-                };
-                positions.set(symbol, newPos);
-
-                logTrade(symbol, 'SELL', 'ENTRY', executionPrice, positionSize, fee, 0, 0, timestamp, 'SHORT', 'LIVE_FORWARD');
-                upsertActivePosStmt.run(
-                    symbol,
-                    'SHORT',
-                    positionSize,
-                    executionPrice,
-                    executionPrice,
-                    executionPrice,
-                    executionPrice,
-                    initialTrailingStop,
-                    currentAtr,
-                    0,
-                    0,
-                    timestamp,
-                    timestamp,
-                    'BYBIT'
-                );
-                persistState();
-
-                notifyOrderEntered({
-                    symbol,
-                    entryPrice: executionPrice,
-                    amount: positionSize,
-                    initialStop: initialTrailingStop,
-                    atr: currentAtr,
-                    timestamp,
-                    direction: 'SHORT'
-                }).catch(err => console.error("Discord alert error:", err));
-
-                console.log(`${C.MAGENTA}   💰 Short position opened:${C.RESET} Size: ${positionSize.toFixed(4)} | Safety stop at: $${initialTrailingStop.toFixed(2)} | Remaining balance: $${capital.toFixed(2)}`);
-            }
-        }
+    // Directional Correlation Guard: Max Same-Direction Positions
+    const maxSameDir = config.watchlist.maxSameDirectionPositions;
+    const sameDirectionCount = Array.from(positions.values()).filter(p => p.side === side).length;
+    if (sameDirectionCount >= maxSameDir) {
+        const msg = `Signal skipped: Max same direction positions (${maxSameDir} ${side}) reached`;
+        log.warn({ symbol, side, sameDirectionCount, maxSameDir }, msg);
+        logActivity('ALERT', msg, `${symbol} ${side} entry prevented by directional correlation guardrail`, db);
+        return;
     }
+
+    const signalPrice = close;
+    const slippage = getSlippageForSymbol(symbol);
+    const executionPrice = side === 'LONG' ? signalPrice * (1 + slippage) : signalPrice * (1 - slippage);
+    const atrMult = signalEval.recommendedAtrMultiplier || ATR_MULTIPLIER;
+    const stopDistance = atrMult * snapshot.currentAtr;
+    const initialTrailingStop = side === 'LONG' ? executionPrice - stopDistance : executionPrice + stopDistance;
+
+    // Available Buying Power (10x leverage margin)
+    // Margin used = sum(notional / 10)
+    const currentMarginUsed = Array.from(positions.values()).reduce((sum, p) => sum + ((p.amount * p.entryPrice) / 10), 0);
+    const availableBuyingPower = Math.max(0, capital - currentMarginUsed);
+
+    // Calculate Total Portfolio Open Risk Cap (6% of Total Equity)
+    let totalUnrealized = 0;
+    for (const p of positions.values()) {
+        const pnlCalc = StrategyEngine.calculatePnL(p.side, p.amount, p.entryPrice, p.highestPrice || p.entryPrice, {
+            slippage: getSlippageForSymbol(p.symbol),
+            takerFee: TAKER_FEE,
+            accumulatedFunding: p.accumulatedFunding ?? 0
+        });
+        totalUnrealized += pnlCalc.unrealizedPnl;
+    }
+    const totalEquity = capital + totalUnrealized;
+    const currentOpenRisk = RiskManager.calculateTotalOpenRisk(positions.values());
+
+    let baseRisk = (signalEval.recommendedRiskPct || MAX_RISK_PCT) * learnerWeight;
+    baseRisk = Math.max(0.005, Math.min(0.025, baseRisk));
+
+    const adaptiveRiskPct = RiskManager.calculateAdaptiveRiskPct(db, signalEval.setupType || 'EMA_CROSSOVER', symbol, baseRisk);
+    const proposedRiskDollar = availableBuyingPower * adaptiveRiskPct;
+
+    const riskCapCheck = RiskManager.enforceOpenRiskCap({
+        currentOpenRisk,
+        newPositionRisk: proposedRiskDollar,
+        totalEquity,
+        maxTotalOpenRiskPct: config.risk.maxTotalOpenRiskPct
+    });
+
+    if (!riskCapCheck.allowed) {
+        log.warn({ symbol, side, currentOpenRisk, maxAllowed: riskCapCheck.maxAllowedRisk }, riskCapCheck.reason);
+        logActivity('ALERT', riskCapCheck.reason!, `${symbol} ${side} entry prevented by 6% total open risk cap`, db);
+        return;
+    }
+
+    if (riskCapCheck.wasDownsized) {
+        console.log(`${C.YELLOW}⚠️  ${riskCapCheck.reason}${C.RESET}`);
+        logActivity('ALERT', riskCapCheck.reason!, `${symbol} ${side} entry downsized by total open risk cap`, db);
+    }
+
+    const effectiveRiskPct = availableBuyingPower > 0 ? (riskCapCheck.effectiveRisk / availableBuyingPower) : 0;
+    const sizing = RiskManager.calculatePositionSize({
+        capital: availableBuyingPower,
+        executionPrice,
+        stopDistance,
+        takerFee: TAKER_FEE,
+        maxRiskPct: effectiveRiskPct,
+        leverage: 10,
+    });
+
+    if (!sizing.isAffordable || sizing.positionSize <= 0) {
+        log.warn({ symbol, reason: sizing.rejectionReason, availableBuyingPower }, 'Cannot open position — sizing limit exceeded');
+        return;
+    }
+
+    const positionSize = sizing.positionSize;
+    const notional = positionSize * executionPrice;
+    const marginRequired = notional / 10;
+    const fee = notional * TAKER_FEE;
+
+    // Deduct transaction fee from realized balance (margin is tracked by open position)
+    capital -= fee;
+
+    const resolvedSetupType: SetupType = signalEval.setupType || 'EMA_CROSSOVER';
+    const newPos: Position = {
+        symbol,
+        side,
+        amount: positionSize,
+        entryPrice: executionPrice,
+        highestPrice: executionPrice,
+        lowestPrice: executionPrice,
+        trailingStop: initialTrailingStop,
+        entryTime: timestamp,
+        atr: snapshot.currentAtr,
+        setupType: resolvedSetupType,
+        takeProfitPrice: signalEval.takeProfitPrice,
+        signalPrice,
+        slippageRate: slippage,
+        accumulatedFunding: 0,
+        lastFundingTime: timestamp
+    };
+    positions.set(symbol, newPos);
+    lastTradeTime = timestamp;
+
+    logTrade(
+        symbol,
+        side === 'LONG' ? 'BUY' : 'SELL',
+        'ENTRY',
+        executionPrice,
+        positionSize,
+        fee,
+        0,
+        0,
+        timestamp,
+        side,
+        'LIVE_FORWARD',
+        'BYBIT',
+        resolvedSetupType,
+        signalPrice,
+        executionPrice,
+        slippage,
+        0
+    );
+
+    upsertActivePosStmt.run(
+        symbol,
+        'BYBIT',
+        side,
+        positionSize,
+        executionPrice,
+        executionPrice,
+        executionPrice,
+        executionPrice,
+        initialTrailingStop,
+        snapshot.currentAtr,
+        0,
+        0,
+        timestamp,
+        timestamp,
+        resolvedSetupType,
+        signalPrice,
+        0
+    );
+
+    persistState();
+
+    notifyOrderEntered({
+        symbol,
+        entryPrice: executionPrice,
+        amount: positionSize,
+        initialStop: initialTrailingStop,
+        atr: snapshot.currentAtr,
+        timestamp,
+        direction: side
+    }).catch(err => log.error({ err }, 'Discord alert error'));
+
+    const color = side === 'LONG' ? C.GREEN : C.MAGENTA;
+    console.log(
+        `${color}   💰 ${side} position opened [${resolvedSetupType}]:${C.RESET} ` +
+        `Size: ${positionSize.toFixed(4)} ($${notional.toFixed(2)}) | Margin: $${marginRequired.toFixed(2)} | ` +
+        `Safety stop: $${initialTrailingStop.toFixed(2)} | Risk: ${(adaptiveRiskPct * 100).toFixed(1)}% | Buying Power: $${(availableBuyingPower - marginRequired - fee).toFixed(2)}`
+    );
 }
 
 /**
@@ -916,11 +1044,13 @@ export async function runDryRun() {
     console.log(`\n========================================================================================`);
     console.log(` [DRY RUN VERIFICATION] REAL-TIME BIDIRECTIONAL PERPETUAL ENGINE`);
     console.log(` Monitored Pairs: ${monitoredSymbols.join(', ')}`);
+    console.log(` Mode: ${config.app.executionMode}`);
     console.log(`========================================================================================`);
-    const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
-    const exchange = new ccxt.bybit({ hostname: bybitHostname, options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
+    const exchange = getBybitExchange();
 
     await seedHistoryIfNeeded(exchange);
+
+    const pendingSignals: PendingSignal[] = [];
 
     for (const symbol of monitoredSymbols) {
         console.log(`\n>>> Fetching live Bybit candles for ${symbol}...`);
@@ -928,22 +1058,33 @@ export async function runDryRun() {
             const marketSymbol = toExchangeSymbol(symbol);
             const ohlcv = await fetchOHLCVWithRetry(exchange, marketSymbol, TIMEFRAME, undefined, 5);
             if (!ohlcv || ohlcv.length < 2) {
-                console.error(`Insufficient candles received from exchange for ${symbol}`);
+                log.warn({ symbol }, 'Insufficient candles received from exchange');
                 continue;
             }
 
             const closedCandle = ohlcv[ohlcv.length - 2] as [number, number, number, number, number, number];
             const currentCandle = ohlcv[ohlcv.length - 1] as [number, number, number, number, number, number];
 
-            console.log(`[Closed 1h Candle] ${new Date(closedCandle[0]).toISOString()} | Open: $${closedCandle[1]} High: $${closedCandle[2]} Low: $${closedCandle[3]} Close: $${closedCandle[4]}`);
-            await processTick(symbol, TIMEFRAME, closedCandle, true);
+            console.log(`[Closed ${TIMEFRAME} Candle] ${new Date(closedCandle[0]).toISOString()} | Open: $${closedCandle[1]} High: $${closedCandle[2]} Low: $${closedCandle[3]} Close: $${closedCandle[4]}`);
+            const closedSig = await processTick(symbol, TIMEFRAME, closedCandle, true);
+            if (closedSig) pendingSignals.push(closedSig);
 
             console.log(`[Current Candle] ${new Date(currentCandle[0]).toISOString()} | Open: $${currentCandle[1]} High: $${currentCandle[2]} Low: $${currentCandle[3]} Close: $${currentCandle[4]}`);
-            await processTick(symbol, TIMEFRAME, currentCandle, false);
+            const currentSig = await processTick(symbol, TIMEFRAME, currentCandle, false);
+            if (currentSig && !pendingSignals.some(s => s.symbol === symbol)) pendingSignals.push(currentSig);
         } catch (err) {
-            console.error(`Error during dry run for ${symbol}:`, err);
+            log.error({ err, symbol }, 'Error during dry run for symbol');
         }
         await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    if (pendingSignals.length > 0) {
+        pendingSignals.sort((a, b) => b.adx - a.adx);
+        const maxConcurrent = config.watchlist.maxConcurrentPositions;
+        const availableSlots = Math.max(0, maxConcurrent - positions.size);
+        for (const sig of pendingSignals.slice(0, availableSlots)) {
+            await executeEntry(sig);
+        }
     }
 
     console.log(`\n========================================================================================`);
@@ -952,90 +1093,243 @@ export async function runDryRun() {
     console.log(`========================================================================================\n`);
 }
 
-/**
- * Live execution stream listener polling all pairs concurrently.
- * Schedules 24-hour screener update.
- */
+// -------------------------------------------------------------
+// Graceful Lifecycle Management & Polling Runner Loop
+// -------------------------------------------------------------
+
+let isRunning = true;
+
+function handleShutdown(signal: string) {
+    if (!isRunning) return;
+    isRunning = false;
+    log.info(`Received ${signal}. Flushing state and gracefully exiting Bybit runner...`);
+    try {
+        persistState();
+        setSystemStatus('PAUSED', null, `Runner stopped gracefully via ${signal}`);
+        closeDb();
+    } catch (e) {
+        log.error({ e }, 'Error during graceful shutdown');
+    }
+    process.exit(0);
+}
+
+process.once('SIGINT', () => handleShutdown('SIGINT'));
+process.once('SIGTERM', () => handleShutdown('SIGTERM'));
+
+process.on('unhandledRejection', (reason: any) => {
+    if (isNetworkError(reason)) {
+        console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+        return;
+    }
+    log.error({ reason }, 'Unhandled Promise Rejection');
+});
+
+process.on('uncaughtException', (err: any) => {
+    if (isNetworkError(err)) {
+        console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+        return;
+    }
+    log.fatal({ err }, 'Uncaught Exception in Live Runner');
+    process.exit(1);
+});
+
 export async function startLive() {
-    const bybitHostname = (process.env.BYBIT_HOSTNAME || 'bytick.com').replace(/^api\./, '');
-    const exchange = new ccxt.bybit({ hostname: bybitHostname, options: { defaultType: 'future' }, timeout: 30000, enableRateLimit: true });
+    const exchange = getBybitExchange();
     const lastTimestamps: Record<string, number> = {};
 
+    setSystemStatus('RUNNING', null, 'Bybit live runner started');
+
     console.log(`\n${C.CYAN}${C.BOLD}╔══════════════════════════════════════════════════════════════════════════╗${C.RESET}`);
-    console.log(`${C.CYAN}${C.BOLD}║              🤖  PAPER TRADING BOT — NOW RUNNING                       ║${C.RESET}`);
+    console.log(`${C.CYAN}${C.BOLD}║       🤖  QUANTITATIVE TRADING BOT — ${config.app.executionMode.padEnd(10)} [RUNNING]       ║${C.RESET}`);
     console.log(`${C.CYAN}${C.BOLD}╚══════════════════════════════════════════════════════════════════════════╝${C.RESET}`);
-    console.log(``);
-    console.log(`   ${C.BOLD}📌 What this does:${C.RESET}`);
-    console.log(`      Watches crypto prices on Bybit and makes practice trades`);
-    console.log(`      using simulated money. No real funds are at risk.`);
-    console.log(``);
-    console.log(`   ${C.BOLD}👀 Currently watching:${C.RESET} ${monitoredSymbols.join(', ')} (updates every 24h)`);
-    console.log(`   ${C.BOLD}⏱️  Checks prices:${C.RESET} Every 10 seconds`);
-    console.log(``);
-    console.log(`   ${C.BOLD}📈 Buy signal:${C.RESET} When short-term trend crosses above long-term + market is trending + momentum is healthy`);
-    console.log(`   ${C.BOLD}📉 Sell signal:${C.RESET} When short-term trend crosses below long-term (same filters)`);
-    console.log(``);
-    console.log(`   ${C.BOLD}🛡️  Safety features:${C.RESET}`);
-    console.log(`      • Max 2% of balance risked per trade`);
-    console.log(`      • Auto-exit if price drops past the trailing safety stop`);
-    console.log(`      • Emergency pause if daily losses exceed 5%`);
-    console.log(``);
-    console.log(`   ${C.DIM}Starting balance: $${capital.toFixed(2)} USDT${C.RESET}`);
-    console.log(`${'─'.repeat(74)}\n`);
+    console.log(`   👀 Watching: ${monitoredSymbols.join(', ')}`);
+    console.log(`   ⏱️  Polling Interval: 15 seconds | Timeframe: ${TIMEFRAME}`);
+    console.log(`   🛡️  Risk: Max ${(MAX_RISK_PCT * 100).toFixed(0)}% per trade | Drawdown Limit: ${(config.risk.maxDrawdownPct * 100).toFixed(0)}%`);
+    console.log(`   💰 Balance: $${capital.toFixed(2)} USDT\n`);
 
-    // Start 24-hour automated screener background schedule and run initial scan
     const screener = new DynamicAssetScreener();
-    screener.runScreening().catch(err => console.error("Initial screening error:", err));
-    screener.schedule24Hours();
+    screener.runScreening().catch(err => log.error({ err }, 'Initial screening error'));
+    screener.schedule6Hours();
 
-    // Pre-seed any uninitialized symbols
-    await seedHistoryIfNeeded(exchange);
+    try {
+        await seedHistoryIfNeeded(exchange);
+    } catch (err: any) {
+        if (isNetworkError(err)) {
+            console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+            await new Promise(r => setTimeout(r, 10000));
+        }
+    }
 
-    while (true) {
+    while (isRunning) {
         try {
-            // Re-sync monitored pairs dynamically
+            // 1. Heartbeat & Operator Control Command Handling
+            updateHeartbeat();
+            const sysState = getSystemState();
+
+            if (sysState.pending_command === 'PAUSE') {
+                log.info('Executing PAUSE operator command');
+                setSystemStatus('PAUSED', null, 'Operator requested pause via dashboard');
+                clearPendingCommand();
+            } else if (sysState.pending_command === 'RESUME') {
+                log.info('Executing RESUME operator command');
+                lockoutUntil = 0;
+                setSystemStatus('RUNNING', null, 'Operator requested resume via dashboard');
+                clearPendingCommand();
+            } else if (sysState.pending_command === 'KILL_SWITCH') {
+                log.warn('Executing KILL_SWITCH operator command');
+                marketClosePositions('BYBIT');
+                positions.clear();
+                persistState();
+                clearPendingCommand();
+            }
+
+            const currentStatus = getSystemState().status;
+            const isPaused = currentStatus === 'PAUSED' || config.app.strategyPaused;
+            if (config.app.strategyPaused) {
+                // Ensure dashboard reflects paused status for 15m strategy
+                setSystemStatus('PAUSED', null, '15m strategy paused by operator: zero edge after costs');
+            }
+
             const activePairs = getMonitoredPairs();
             if (activePairs && activePairs.length > 0) {
                 monitoredSymbols = activePairs;
             }
 
-            // Sequential processing loop: fetch one pair at a time with 200ms delay
-            for (const symbol of monitoredSymbols) {
+            // Single batch call to fetch tickers for all symbols (1 API call)
+            let tickers: Record<string, any> = {};
+            try {
+                tickers = await exchange.fetchTickers();
+            } catch (err: any) {
+                if (isNetworkError(err)) {
+                    console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+                    await new Promise(r => setTimeout(r, 10000));
+                    continue;
+                }
+                log.warn({ err: err?.message || err }, 'Failed batch fetching tickers, will rely on OHLCV prices');
+            }
+
+            // 2. Pending signals collection across the monitored universe
+            const pendingSignals: PendingSignal[] = [];
+
+            // Stagger symbol requests by 300ms each to prevent Bybit rate-limit warnings
+            for (const symbol of [...monitoredSymbols]) {
+                if (!isRunning) break;
                 try {
+                    // Check candle count in SQLite; if count < 100, fetch 200 candles before evaluating
+                    const historyOk = await ensureCandleHistory(exchange, symbol, TIMEFRAME, 100);
+                    if (!historyOk && !monitoredSymbols.includes(symbol)) {
+                        continue; // Invalid symbol was pruned from watchlist
+                    }
+
                     const marketSymbol = toExchangeSymbol(symbol);
                     const ohlcv = await fetchOHLCVWithRetry(exchange, marketSymbol, TIMEFRAME, undefined, 3);
                     if (ohlcv && ohlcv.length >= 2) {
                         const closedCandle = ohlcv[ohlcv.length - 2] as [number, number, number, number, number, number];
                         const currentCandle = ohlcv[ohlcv.length - 1] as [number, number, number, number, number, number];
 
+                        // Cache ticker price into currentCandle close if available
+                        const cachedTicker = tickers[marketSymbol] || tickers[symbol] || tickers[`${symbol}:USDT`];
+                        if (cachedTicker && cachedTicker.last) {
+                            currentCandle[4] = cachedTicker.last;
+                        }
+
                         if (closedCandle && (!lastTimestamps[symbol] || closedCandle[0] > lastTimestamps[symbol])) {
-                            console.log(`\n${C.CYAN}🕐 New hourly candle closed${C.RESET} ${symbol} at ${new Date(closedCandle[0]).toLocaleTimeString()}`);
-                            await processTick(symbol, TIMEFRAME, closedCandle, true);
+                            console.log(`\n${C.CYAN}🕐 New ${TIMEFRAME} candle closed${C.RESET} ${symbol} at ${new Date(closedCandle[0]).toLocaleTimeString()}`);
+                            const closedSig = await processTick(symbol, TIMEFRAME, closedCandle, true, isPaused);
+                            if (closedSig) {
+                                pendingSignals.push(closedSig);
+                            }
                             lastTimestamps[symbol] = closedCandle[0];
                         }
 
-                        // Process current incomplete candle for real-time intrabar trailing stop ratcheting / trigger
-                        await processTick(symbol, TIMEFRAME, currentCandle, false);
+                        const currentSig = await processTick(symbol, TIMEFRAME, currentCandle, false, isPaused);
+                        if (currentSig && !pendingSignals.some(s => s.symbol === symbol)) {
+                            pendingSignals.push(currentSig);
+                        }
                     }
                 } catch (err: any) {
-                    console.error(`Error processing live data for ${symbol}:`, err?.message || err);
+                    if (isBadSymbolError(err)) {
+                        removeInvalidSymbol(symbol, err?.message || 'Invalid symbol on exchange');
+                        continue;
+                    }
+                    if (isNetworkError(err)) {
+                        throw err;
+                    }
+                    log.error({ err: err?.message || err, symbol }, 'Error processing live data for symbol');
                 }
 
-                // Guarantee burst limits are respected with manual 200ms delay between pair requests
-                await new Promise((resolve) => setTimeout(resolve, 200));
+                // Stagger symbol requests by 300ms
+                await new Promise((resolve) => setTimeout(resolve, 300));
             }
-        } catch (e) {
-            console.error("Error fetching live data:", e);
+
+            // 3. Signal Quality Ranking & Priority Execution
+            if (pendingSignals.length > 0 && !isPaused) {
+                // Sort by ADX descending (strongest trends first)
+                pendingSignals.sort((a, b) => b.adx - a.adx);
+
+                const maxConcurrent = config.watchlist.maxConcurrentPositions;
+                const currentOpenPositions = positions.size;
+                const availableSlots = Math.max(0, maxConcurrent - currentOpenPositions);
+                const selectedSignals = pendingSignals.slice(0, availableSlots);
+
+                if (selectedSignals.length > 0) {
+                    console.log(`\n${C.CYAN}🎯 Signal Ranking:${C.RESET} Selected top ${selectedSignals.length} of ${pendingSignals.length} candidates by ADX (Available slots: ${availableSlots}/${maxConcurrent})`);
+                    for (const sig of selectedSignals) {
+                        await executeEntry(sig);
+                    }
+                }
+            }
+
+            // Counterfactual Learning: Evaluate open shadow trades
+            const currentPricesMap = new Map<string, { close: number; high: number; low: number }>();
+            for (const sym of monitoredSymbols) {
+                const row = db.prepare('SELECT close, high, low FROM candles WHERE symbol = ? AND timeframe = ? ORDER BY timestamp DESC LIMIT 1').get(sym, TIMEFRAME) as any;
+                if (row) {
+                    currentPricesMap.set(sym, { close: row.close, high: row.high, low: row.low });
+                }
+            }
+            const shadowRes = StrategyLearner.evaluateShadowTrades(db, currentPricesMap);
+            if (shadowRes.adjustments.length > 0) {
+                for (const adj of shadowRes.adjustments) {
+                    console.log(`${C.YELLOW}🧠 ${adj}${C.RESET}`);
+                    logActivity('STATE_CHANGE', adj, 'Shadow trade counterfactual filter tuning', db);
+                }
+            }
+        } catch (e: any) {
+            if (isNetworkError(e)) {
+                console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+                await new Promise(r => setTimeout(r, 10000));
+                continue;
+            }
+            log.error({ e }, 'Error in live polling loop');
         }
         maybePrintSummary();
-        await new Promise(r => setTimeout(r, 10000)); // Poll every 10s
+        await new Promise(r => setTimeout(r, 15000)); // Poll every 15 seconds
     }
 }
 
 if (require.main === module) {
     if (process.argv.includes('--dry-run')) {
-        runDryRun().catch(console.error);
+        runDryRun().catch(err => {
+            log.fatal({ err }, 'Dry run error');
+            process.exit(1);
+        });
     } else {
-        startLive().catch(console.error);
+        const runForever = async () => {
+            while (isRunning) {
+                try {
+                    await startLive();
+                } catch (err: any) {
+                    if (isNetworkError(err)) {
+                        console.log(`\x1b[33m[NETWORK]\x1b[0m Network offline: Retrying in 10s...`);
+                        await new Promise(r => setTimeout(r, 10000));
+                    } else {
+                        log.fatal({ err }, 'Fatal Live Runner Error');
+                        process.exit(1);
+                    }
+                }
+            }
+        };
+        runForever();
     }
 }
