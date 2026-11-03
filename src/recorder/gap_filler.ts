@@ -61,11 +61,14 @@ export class GapFiller {
      * Routine executed on recorder startup or post-outage:
      * Checks the latest recorded timestamp for each tracked contract and fetches missing 1m klines,
      * funding rates, and open interest.
-     * Inserts missing rows only (no updates or deletes, WAL & append-only safe).
+     * 
+     * Rule: A gap is recorded ONLY when missing candles are CONFIRMED missing after a successful fetch
+     * (HTTP 200, retCode 0), comparing against the last closed minute: floor(now/60000)*60000 - 60000.
      */
     public async backfillStartupGaps(
         trackedSymbols: string[],
-        maxLookbackMinutes: number = 1440 // 24 hours max backfill window
+        maxLookbackMinutes: number = 10080, // Default: 7 days lookback (configurable)
+        rankedByTurnoverSymbols?: string[]
     ): Promise<GapFillSummary> {
         const summary: GapFillSummary = {
             symbolsChecked: 0,
@@ -78,17 +81,24 @@ export class GapFiller {
         };
 
         const now = Date.now();
+        // Compare strictly against the last CLOSED minute
+        const lastClosedMinute = Math.floor(now / 60000) * 60000 - 60000;
         const maxLookbackMs = maxLookbackMinutes * 60 * 1000;
-        log.info({ trackedSymbolsCount: trackedSymbols.length }, 'Commencing throttled startup/recovery backfill scan for all symbols...');
+        const minAllowedTs = lastClosedMinute - maxLookbackMs;
+
+        log.info({
+            trackedSymbolsCount: trackedSymbols.length,
+            maxLookbackMinutes,
+            lastClosedMinuteIso: new Date(lastClosedMinute).toISOString()
+        }, 'Commencing throttled startup/recovery backfill scan for all symbols...');
 
         const CHUNK_SIZE = 8;
-        const CHUNK_DELAY_MS = 500; // 500ms throttle between batches of 8 (~16 req/s ceiling)
+        const CHUNK_DELAY_MS = 200; // ~10 req/s ceiling
 
         // 1. Backfill 1m Klines per symbol in throttled chunks
         for (let i = 0; i < trackedSymbols.length; i += CHUNK_SIZE) {
-            // If IP ban is active, halt backfill immediately
             if (this.client.isBanActive()) {
-                log.warn('Bybit REST ban circuit breaker is active; pausing startup backfill loop.');
+                log.warn('Bybit REST ban circuit breaker is active; pausing backfill loop.');
                 break;
             }
 
@@ -99,11 +109,12 @@ export class GapFiller {
                 const latestTs = this.db.getLatestKlineTimestamp(symbol);
 
                 if (!latestTs) {
-                    // Cold start: fetch recent initial 1000 bars (covers ~16.6h)
+                    // Cold start: fetch recent initial 1000 closed bars
                     try {
-                        const initialKlines = await this.client.fetch1mKlines(symbol, 1000);
-                        if (initialKlines.length > 0) {
-                            const count = this.db.insertKlines(initialKlines);
+                        const initialKlines = await this.client.fetch1mKlines(symbol, 1000, minAllowedTs, lastClosedMinute);
+                        const closedInitial = initialKlines.filter(k => k.timestamp <= lastClosedMinute);
+                        if (closedInitial.length > 0) {
+                            const count = this.db.insertKlines(closedInitial);
                             summary.candlesFilled += count;
                             summary.details.push(`${symbol}: Cold start populated with ${count} 1m candles`);
                         }
@@ -113,52 +124,82 @@ export class GapFiller {
                     continue;
                 }
 
-                const gapDurationMs = now - latestTs;
-                // If more than 1 minute missing, we have a gap to fill
-                if (gapDurationMs > 60000) {
-                    const missingCount = Math.floor(gapDurationMs / 60000);
-                    summary.gapsDetected++;
+                // If latest stored bar is before the last closed minute, check missing span
+                if (latestTs < lastClosedMinute) {
+                    const fetchStart = Math.max(latestTs + 60000, minAllowedTs);
+                    const fetchEnd = lastClosedMinute;
+                    const expectedBarsCount = Math.floor((fetchEnd - fetchStart) / 60000) + 1;
 
-                    const gapId = this.db.recordGap({
-                        symbol,
-                        dataType: 'kline_1m',
-                        gapStart: latestTs + 60000,
-                        gapEnd: now,
-                        missingCount,
-                        detectedAt: now,
-                        cause: 'outage_or_rotation_shortfall'
-                    });
+                    if (expectedBarsCount <= 0) continue;
 
-                    // Fetch missing bars with pagination for windows > 1,000 bars
+                    let missingKlines: Kline1m[] = [];
+                    let fetchSucceeded = false;
+                    let fetchErrorMessage = '';
+
                     try {
-                        const fetchStart = Math.max(latestTs + 60000, now - maxLookbackMs);
-                        const missingKlines = await this.fetchAll1mKlinesInRange(symbol, fetchStart, now);
-
-                        if (missingKlines.length > 0) {
-                            const count = this.db.insertKlines(missingKlines);
-                            summary.candlesFilled += count;
-                            this.db.resolveGap(gapId, Date.now());
-                            summary.details.push(`${symbol}: Backfilled ${count} missing 1m candles across ${missingCount}m gap`);
-                        } else {
-                            summary.unresolvedGaps++;
-                            summary.details.push(`${symbol}: Gap detected (${missingCount}m) but exchange served 0 candles`);
-                        }
+                        missingKlines = await this.fetchAll1mKlinesInRange(symbol, fetchStart, fetchEnd);
+                        // Filter out any bar beyond the last closed minute
+                        missingKlines = missingKlines.filter(k => k.timestamp <= lastClosedMinute);
+                        fetchSucceeded = true;
                     } catch (err: any) {
+                        fetchErrorMessage = err?.message || String(err);
+                        log.warn({ symbol, err: fetchErrorMessage }, 'Kline fetch failed during backfill');
+                    }
+
+                    if (fetchSucceeded) {
+                        let inserted = 0;
+                        if (missingKlines.length > 0) {
+                            inserted = this.db.insertKlines(missingKlines);
+                            summary.candlesFilled += inserted;
+                        }
+
+                        // Gap confirmation rule:
+                        // Record a gap only if missing candles are CONFIRMED missing after successful fetch
+                        if (missingKlines.length < expectedBarsCount) {
+                            const missingCount = expectedBarsCount - missingKlines.length;
+                            summary.gapsDetected++;
+
+                            // Record confirmed gap; mark resolved since the exchange was queried and all available bars were stored
+                            const gapId = this.db.recordGap({
+                                symbol,
+                                dataType: 'kline_1m',
+                                gapStart: fetchStart,
+                                gapEnd: fetchEnd,
+                                missingCount,
+                                detectedAt: now,
+                                resolvedAt: now,
+                                cause: 'confirmed_zero_volume_or_exchange_omission'
+                            });
+
+                            summary.details.push(
+                                `${symbol}: Confirmed ${missingCount} empty/missing bars across ${expectedBarsCount}m window (filled ${inserted} available bars)`
+                            );
+                        } else {
+                            summary.details.push(
+                                `${symbol}: Backfilled ${inserted} missing 1m candles seamlessly (100% contiguous)`
+                            );
+                        }
+                    } else {
+                        // Fetch failed: do NOT record a confirmed gap; record open gap for retry if desired
                         summary.unresolvedGaps++;
-                        summary.details.push(`${symbol}: Gap fill failed: ${err.message}`);
+                        summary.details.push(`${symbol}: Gap fill fetch error: ${fetchErrorMessage}`);
                     }
                 }
             }
 
-            // Pacing delay between chunks of 10 symbols
+            // Pacing delay between chunks
             if (i + CHUNK_SIZE < trackedSymbols.length) {
                 await new Promise(res => setTimeout(res, CHUNK_DELAY_MS));
             }
         }
 
-        // 2. Backfill Funding Rates & Open Interest for Core Symbols
-        const coreSymbols = trackedSymbols.slice(0, 50); // prioritize top symbols for historical funding & OI
-        for (const symbol of coreSymbols) {
+        // 2. Backfill Funding Rates & Open Interest
+        // Prioritize symbols ranked by 24h turnover if provided, otherwise all symbols in throttled mode
+        const targetFundingSymbols = rankedByTurnoverSymbols && rankedByTurnoverSymbols.length > 0
+            ? rankedByTurnoverSymbols
+            : trackedSymbols;
+
+        for (const symbol of targetFundingSymbols) {
             if (this.client.isBanActive()) break;
             try {
                 const latestFunding = this.db.getLatestFundingRateTimestamp(symbol);
@@ -181,6 +222,7 @@ export class GapFiller {
             } catch {
                 // Ignore transient historical funding/OI errors
             }
+            await new Promise(res => setTimeout(res, 20));
         }
 
         log.info({
@@ -196,10 +238,10 @@ export class GapFiller {
 
     /**
      * Backfill routine executed immediately after an outage is resolved.
-     * Marks streaming feeds as streams_lost, then backfills klines, funding, and open interest from REST history.
+     * Records streams_lost for the outage window, then backfills klines and funding for affected symbols.
      */
     public async backfillAfterOutage(
-        trackedSymbols: string[],
+        affectedSymbols: string[],
         outageStart: number,
         outageEnd: number,
         cause: string = 'network_outage'
@@ -209,10 +251,11 @@ export class GapFiller {
             outageStart: new Date(outageStart).toISOString(),
             outageEnd: new Date(outageEnd).toISOString(),
             durationMinutes,
-            cause
-        }, '[RECOVERY] Executing post-outage recovery: recording streams_lost and backfilling REST data');
+            cause,
+            symbolsCount: affectedSymbols.length
+        }, '[RECOVERY] Executing post-outage recovery: recording streams_lost and backfilling affected symbols');
 
-        // 1. Mark streaming feeds as permanently lost during outage window (liquidations & orderbook depth cannot be backfilled)
+        // Record streams_lost: liquidations and orderbook snapshots cannot be backfilled
         this.db.recordGap({
             symbol: 'ALL',
             dataType: 'streams_lost',
@@ -224,13 +267,13 @@ export class GapFiller {
             cause: `Streams lost: liquidations and orderbook snapshots cannot be backfilled from REST (${cause})`
         });
 
-        // 2. Backfill 1m klines, funding, and open interest
-        return this.backfillStartupGaps(trackedSymbols, Math.max(60, durationMinutes + 10));
+        // Backfill only the affected symbols and duration
+        return this.backfillStartupGaps(affectedSymbols, Math.max(60, durationMinutes + 15));
     }
 
     /**
      * Fetches all 1m klines across a time window by paging through windows > 1,000 bars.
-     * Guaranteed insert-only within the rate limiter.
+     * Filters out any forming candle (timestamp + 60000 > now).
      */
     public async fetchAll1mKlinesInRange(
         symbol: string,
@@ -240,8 +283,9 @@ export class GapFiller {
         const allKlines: Kline1m[] = [];
         let cursorStart = startTs;
         const seenTimestamps = new Set<number>();
-        const maxPages = 20; // safety ceiling up to 20,000 bars
+        const maxPages = 50; // allows backfilling up to 50,000 bars (~34 days)
         let pageCount = 0;
+        const now = Date.now();
 
         while (cursorStart < endTs && pageCount < maxPages) {
             if (this.client.isBanActive()) break;
@@ -257,6 +301,9 @@ export class GapFiller {
             }
 
             for (const bar of page) {
+                // Reject currently forming candles
+                if (bar.timestamp + 60000 > now) continue;
+
                 if (!seenTimestamps.has(bar.timestamp)) {
                     seenTimestamps.add(bar.timestamp);
                     allKlines.push(bar);
@@ -275,9 +322,10 @@ export class GapFiller {
     }
 
     /**
-     * Scans and resolves all open kline_1m gaps in data_gaps table.
-     * Pages through gaps > 1,000 bars, inserts missing candles (insert-only),
-     * and marks the gap records resolved.
+     * Scans and resolves open kline_1m gaps in data_gaps table.
+     * Pages through gaps, inserts missing candles (insert-only),
+     * and calls resolveGap ONLY when the filled range is verified contiguous or the exchange
+     * returned a successful empty result for it. A fetch error leaves the gap open.
      */
     public async resolveOpenKlineGaps(): Promise<{
         resolvedCount: number;
@@ -292,7 +340,7 @@ export class GapFiller {
             ORDER BY gap_start ASC
         `).all() as Array<{ id: number; symbol: string; gapStart: number; gapEnd: number; missingCount: number }>;
 
-        log.info({ openGapsCount: openGaps.length }, 'Resolving open kline gaps with paging > 1,000 bars...');
+        log.info({ openGapsCount: openGaps.length }, 'Resolving open kline gaps with verified contiguous checks...');
         let resolvedCount = 0;
         let candlesFilled = 0;
 
@@ -303,27 +351,51 @@ export class GapFiller {
             const batch = openGaps.slice(i, i + BATCH_SIZE);
             const results = await Promise.allSettled(
                 batch.map(async (gap) => {
-                    const klines = await this.fetchAll1mKlinesInRange(gap.symbol, gap.gapStart, gap.gapEnd);
+                    let klines: Kline1m[] = [];
+                    try {
+                        klines = await this.fetchAll1mKlinesInRange(gap.symbol, gap.gapStart, gap.gapEnd);
+                    } catch (err: any) {
+                        // Fetch failed: re-throw so Promise.allSettled marks as rejected (leaves gap open)
+                        throw new Error(`Fetch error for ${gap.symbol} [${gap.gapStart}-${gap.gapEnd}]: ${err.message}`);
+                    }
+
                     let inserted = 0;
                     if (klines.length > 0) {
                         inserted = this.db.insertKlines(klines);
                     }
-                    this.db.resolveGap(gap.id, Date.now());
-                    return { gapId: gap.id, inserted };
+
+                    // Verification: resolveGap ONLY when range is verified contiguous or exchange confirmed empty result
+                    const expectedBars = Math.max(1, Math.floor((gap.gapEnd - gap.gapStart) / 60000) + 1);
+                    const isContiguous = klines.length === expectedBars;
+                    const isEmptyConfirmed = klines.length === 0;
+
+                    if (isContiguous || isEmptyConfirmed) {
+                        this.db.resolveGap(gap.id, Date.now());
+                        return { gapId: gap.id, inserted, resolved: true };
+                    } else {
+                        // Partial fill: inserted available bars, but leave gap open for remaining missing bars
+                        return { gapId: gap.id, inserted, resolved: false };
+                    }
                 })
             );
 
             for (const res of results) {
                 if (res.status === 'fulfilled') {
-                    resolvedCount++;
                     candlesFilled += res.value.inserted;
+                    if (res.value.resolved) {
+                        resolvedCount++;
+                    }
                 } else {
-                    log.warn({ err: res.reason?.message || res.reason }, 'Failed to resolve kline gap in batch');
+                    log.warn({ err: res.reason?.message || res.reason }, 'Failed to resolve kline gap; leaving gap open');
                 }
             }
 
             if ((i + BATCH_SIZE) % 60 === 0 || i + BATCH_SIZE >= openGaps.length) {
-                log.info({ progress: `${Math.min(i + BATCH_SIZE, openGaps.length)}/${openGaps.length}`, resolvedCount, candlesFilled }, 'Resolving open kline gaps progress');
+                log.info({
+                    progress: `${Math.min(i + BATCH_SIZE, openGaps.length)}/${openGaps.length}`,
+                    resolvedCount,
+                    candlesFilled
+                }, 'Resolving open kline gaps progress');
             }
         }
 

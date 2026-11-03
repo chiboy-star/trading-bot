@@ -269,13 +269,13 @@ export class QualityReporter {
                         });
                     }
                 } catch (err: any) {
-                    cand.verification = `EXCHANGE CHECK FAILED: ${err.message}`;
+                    cand.verification = `UNKNOWN_REQUEST_FAILED: ${err.message}`;
                     exchangeAuditSample.push({
                         symbol: cand.symbol,
                         storedBars: cand.storedBars,
                         exchangeAvailableBars: -1,
                         status: 'OFFLINE',
-                        details: `Bybit REST query error: ${err.message}`
+                        details: `Bybit REST query error (fail closed): ${err.message}`
                     });
                 }
             }
@@ -328,27 +328,39 @@ export class QualityReporter {
             gapsByDataType[row.dataType] = (gapsByDataType[row.dataType] || 0) + 1;
         }
 
-        // Full table aggregates for shared source of truth
+        // Full table aggregates with exact disjoint partition
+        // 1. Unrecoverable: all rows representing stream losses (liquidations, orderbook depth)
+        // 2. Open: recoverable gaps where resolved_at IS NULL
+        // 3. Resolved: recoverable gaps where resolved_at IS NOT NULL
         const totGapsRow = rawDb.prepare(`SELECT COUNT(*) as cnt FROM data_gaps`).get() as { cnt: number };
         const totalGapsDetected = totGapsRow?.cnt || 0;
 
+        const isStreamLostClause = `(data_type = 'streams_lost' OR data_type LIKE '%stream%' OR data_type LIKE '%liq%' OR data_type LIKE '%orderbook%' OR data_type LIKE '%depth%')`;
+
         const unrecRow = rawDb.prepare(`
             SELECT COUNT(*) as cnt FROM data_gaps
-            WHERE data_type = 'streams_lost' OR data_type LIKE '%stream%' OR data_type LIKE '%liq%' OR data_type LIKE '%orderbook%' OR data_type LIKE '%depth%'
+            WHERE ${isStreamLostClause}
         `).get() as { cnt: number };
         const unrecoverableStreamGaps = unrecRow?.cnt || 0;
 
         const openRecRow = rawDb.prepare(`
             SELECT COUNT(*) as cnt FROM data_gaps
-            WHERE resolved_at IS NULL AND data_type NOT IN ('streams_lost') AND data_type NOT LIKE '%stream%' AND data_type NOT LIKE '%liq%' AND data_type NOT LIKE '%orderbook%'
+            WHERE resolved_at IS NULL AND NOT ${isStreamLostClause}
         `).get() as { cnt: number };
         const openRecoverableGaps = openRecRow?.cnt || 0;
 
         const resRecRow = rawDb.prepare(`
             SELECT COUNT(*) as cnt FROM data_gaps
-            WHERE resolved_at IS NOT NULL AND data_type NOT IN ('streams_lost') AND data_type NOT LIKE '%stream%' AND data_type NOT LIKE '%liq%' AND data_type NOT LIKE '%orderbook%'
+            WHERE resolved_at IS NOT NULL AND NOT ${isStreamLostClause}
         `).get() as { cnt: number };
         const resolvedGaps = resRecRow?.cnt || 0;
+
+        // Reconcile gap totals assertion: resolved + open + unrecoverable = total
+        if (unrecoverableStreamGaps + openRecoverableGaps + resolvedGaps !== totalGapsDetected) {
+            throw new Error(
+                `Gap totals reconciliation failure: unrecoverable(${unrecoverableStreamGaps}) + open(${openRecoverableGaps}) + resolved(${resolvedGaps}) !== total(${totalGapsDetected})`
+            );
+        }
 
         const maxGapRow = rawDb.prepare(`
             SELECT MAX(gap_end - gap_start) as maxGapMs FROM data_gaps
@@ -400,12 +412,14 @@ export class QualityReporter {
 
         const monthlyEstimatedGb = parseFloat(((dailyEstimatedMb * 30) / 1024).toFixed(2));
         const annualEstimatedGb = parseFloat(((dailyEstimatedMb * 365) / 1024).toFixed(2));
+        const latestEpoch = this.db.getLatestEpoch();
 
         return {
             generatedAt: now,
             evaluationWindowMs: windowMs,
             windowStart,
             windowEnd: now,
+            epoch: latestEpoch,
             storage: {
                 dbPath: this.db.dbPath,
                 dbSizeBytes,
@@ -491,6 +505,7 @@ export class QualityReporter {
 
 **Generated:** \`${genDate}\`  
 **Evaluation Window:** Bybit Market Data Recorder - 24-Hour Data Quality Report (Active Recorder Timespan: **${report.recorderCompleteness.recordingSpanText}**; Log Window: \`${winStartDate}\` to \`${genDate}\`)  
+**Clean Data Epoch:** ${report.epoch ? `\`${report.epoch.epochId}\` (Started: \`${new Date(report.epoch.startedAt).toISOString()}\`) - *${report.epoch.description}*` : 'None defined'}  
 **Database Path:** \`${report.storage.dbPath}\`  
 **Current Disk Footprint:** **${report.storage.dbSizeMb} MB** (\`${report.storage.dbSizeBytes.toLocaleString()} bytes\`)  
 **Freshness Status:** ${report.freshness.isStale ? `[STALE] **STALE** (${report.freshness.staleReason})` : '[HEALTHY] **HEALTHY & CURRENT**'}

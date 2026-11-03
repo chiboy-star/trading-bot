@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger Daily SQLite Online Backup at 03:00 UTC
+RefuseManualStart=no
+RefuseManualStop=no
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

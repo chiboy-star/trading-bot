@@ -143,6 +143,10 @@ Records actual funding rates across all linear contracts.
 ### 3.5 `open_interest` (Contract Open Interest Snapshots)
 Records total open contracts and dollar value across all linear perpetuals.
 
+> [!NOTE]
+> **Open Interest Sampling Frequency:**
+> Bybit tickers refresh open interest every 5 minutes on the exchange matching engine. Storing all symbols every minute previously bloated the database with 50%–75% redundant duplicate rows. To preserve high signal while slashing disk overhead, the recorder stores all active contracts every 5 minutes and high-frequency benchmarks (`BTCUSDT` and `ETHUSDT`) every 1 minute.
+
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
 | `symbol` | TEXT | NOT NULL | Contract symbol |
@@ -150,6 +154,7 @@ Records total open contracts and dollar value across all linear perpetuals.
 | `open_interest` | REAL | NOT NULL | Open contracts in base units |
 | `open_interest_value` | REAL | NOT NULL | Notional open interest value in USDT |
 | `recorded_at` | INTEGER | NOT NULL | Capture timestamp ms |
+| `is_backfilled` | INTEGER | DEFAULT 0 | 1 if backfilled from historical REST |
 
 **Indexes & Constraints:**
 - `PRIMARY KEY (symbol, timestamp)`
@@ -215,16 +220,22 @@ Records the top 25 bids and asks at a sampled 10-second interval strictly for a 
 ### 3.8 `data_gaps` (Continuity & Outage Log)
 Tracks detected timestamp discontinuities caused by internet/power drops and logs backfill resolution.
 
+> [!IMPORTANT]
+> **Mutable Policy for `data_gaps`:**
+> `data_gaps` is intentionally mutable exclusively on `resolved_at` so that when a network outage or missing candle interval is successfully backfilled, the gap record is stamped with `resolved_at = timestamp`.
+> Deletions are strictly prohibited via `abort_delete_data_gaps`.
+
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
 | `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | Gap ID |
 | `symbol` | TEXT | NOT NULL | Contract symbol |
-| `data_type` | TEXT | NOT NULL | `kline_1m`, `funding`, `open_interest`, `orderbook` |
+| `data_type` | TEXT | NOT NULL | `kline_1m`, `funding`, `open_interest`, `orderbook`, `streams_lost`, `network_outage` |
 | `gap_start` | INTEGER | NOT NULL | Expected start timestamp of missing data |
 | `gap_end` | INTEGER | NOT NULL | Expected end timestamp of missing data |
 | `missing_count` | INTEGER | NOT NULL | Estimated count of missing records |
 | `detected_at` | INTEGER | NOT NULL | Detection timestamp ms |
 | `resolved_at` | INTEGER | NULLABLE | Resolution/backfill completion timestamp ms |
+| `cause` | TEXT | NULLABLE | Diagnostic reason (e.g. `streams_lost: WS disconnect`) |
 
 ---
 
@@ -238,26 +249,61 @@ Records periodic heartbeats and silence detection events for SLA monitoring.
 | `active_symbols_count` | INTEGER | NOT NULL | Number of tracked active contracts |
 | `status` | TEXT | NOT NULL | `HEALTHY`, `STALE`, `RECONNECTING`, `DEGRADED` |
 | `last_data_timestamp` | INTEGER | NOT NULL | Timestamp ms of most recent data record |
-| `details` | TEXT | NULLABLE | Contextual status message |
+| `details` | TEXT | NULLABLE | Contextual status message (stream freshness, shard counts) |
 
 ---
 
-## 4. Deduplication & Restart Idempotency
+### 3.10 `data_epochs` (Clean Dataset Milestones)
+Records append-only epoch markers that demarcate schema or ingestion fidelity boundaries.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `epoch_id` | TEXT | PRIMARY KEY | Unique milestone identifier |
+| `started_at` | INTEGER | NOT NULL | Epoch start timestamp ms |
+| `description` | TEXT | NOT NULL | Plain-text explanation of data guarantees |
+
+> [!WARNING]
+> **Invalidity of Pre-Epoch Orderbook Depth:**
+> Prior to `clean_data_phase2`, orderbook WebSocket messages received as deltas were inadvertently stored as full depth snapshots, corrupting pre-epoch depth levels.
+> **All research queries and execution simulations using `orderbook_snapshots` must filter strictly on:**
+> `WHERE timestamp >= (SELECT started_at FROM data_epochs WHERE epoch_id = 'clean_data_phase2')`.
+
+---
+
+### 3.11 `klines_1m_final` (Additive, Strictly Closed Bars)
+An additive, immutable table storing verified, strictly closed 1-minute bars populated via bulk REST history pagination (`scripts/populate_klines_1m_final.ts`).
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `symbol` | TEXT | NOT NULL | Contract symbol |
+| `timestamp` | INTEGER | NOT NULL | Closed bar timestamp ms |
+| `open` | REAL | NOT NULL | Open price |
+| `high` | REAL | NOT NULL | High price |
+| `low` | REAL | NOT NULL | Low price |
+| `close` | REAL | NOT NULL | Final close price |
+| `volume` | REAL | NOT NULL | Traded base asset volume |
+| `turnover` | REAL | NOT NULL | Traded turnover in USDT |
+
+**Indexes & Constraints:**
+- `PRIMARY KEY (symbol, timestamp)`
+
+---
+
+## 4. Deduplication & Append-Only Immutability Triggers
 
 When the recorder restarts after a power failure, system crash, or network drop:
-1. **Snapshots:** `INSERT OR IGNORE INTO contract_snapshots` relies on `UNIQUE(snapshot_timestamp, symbol)`. Repeated snapshots of the same hour produce zero duplicates.
-2. **Klines:** `INSERT OR IGNORE INTO klines_1m` uses `PRIMARY KEY(symbol, timestamp)`. Overlapping bar fetches are cleanly ignored.
+1. **Snapshots:** `INSERT OR IGNORE INTO contract_snapshots` relies on `UNIQUE(snapshot_timestamp, symbol)`. Repeated snapshots produce zero duplicates.
+2. **Klines:** `INSERT OR IGNORE INTO klines_1m` and `klines_1m_final` use `PRIMARY KEY(symbol, timestamp)`. Overlapping bar fetches are cleanly ignored.
 3. **Funding Rates & Open Interest:** Protected by composite primary keys `(symbol, timestamp)`.
 4. **Order Books & Liquidations:** Protected by composite unique indexes.
-5. **Database-Level Immutability Triggers:**
-   SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers are compiled into the schema for all recorded data tables:
-   ```sql
-   CREATE TRIGGER abort_update_contract_snapshots BEFORE UPDATE ON contract_snapshots
-   BEGIN SELECT RAISE(ABORT, 'Mutation forbidden: table contract_snapshots is append-only'); END;
-   CREATE TRIGGER abort_delete_contract_snapshots BEFORE DELETE ON contract_snapshots
-   BEGIN SELECT RAISE(ABORT, 'Deletion forbidden: table contract_snapshots is append-only'); END;
-   ```
-   Any manual or script attempt to mutate or delete historical data points is blocked with a SQL `ABORT` error.
+5. **Database-Level Immutability Policy (21 SQLite Triggers):**
+   SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers enforce strict append-only storage across recorded tables:
+   - **10 Tables with BOTH `abort_update` and `abort_delete` triggers (20 triggers):**
+     `contract_snapshots`, `listing_events`, `klines_1m`, `funding_rates`, `open_interest`, `liquidations`, `orderbook_snapshots`, `recorder_heartbeats`, `data_epochs`, `klines_1m_final`.
+   - **1 Table with `abort_delete` trigger only (1 trigger):**
+     `data_gaps` intentionally permits `UPDATE` exclusively on `resolved_at` when missing intervals are backfilled, while `DELETE` is permanently forbidden.
+   - **Total Trigger Count:** Exactly 21 active triggers registered in `sqlite_master`.
+   Any unauthorized attempt to mutate or delete historical data points is blocked with a SQL `ABORT` error.
 
 ---
 

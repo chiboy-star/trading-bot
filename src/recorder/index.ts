@@ -6,6 +6,8 @@ import { createLogger } from '../utils/logger';
 const log = createLogger('recorder-main');
 
 async function main() {
+    RecorderService.setupProcessSafetyHandlers();
+
     const args = process.argv.slice(2);
     const isReportOnly = args.includes('--report');
     const isDryRun = args.includes('--dry-run');
@@ -25,7 +27,7 @@ Order-book Depth: Top-25 levels (BTC, ETH, and listings <72h)
     if (isReportOnly) {
         const db = new RecorderDB();
         const { BybitPublicClient } = await import('./bybit_client');
-        const client = new BybitPublicClient({ rateLimitDelayMs: 60 });
+        const client = new BybitPublicClient({ rateLimitDelayMs: 60, maxRetries: 1, requestTimeoutMs: 2500 });
         const reporter = new QualityReporter(db, client);
         const report = await reporter.generateReport(24);
         console.log(reporter.formatMarkdownReport(report));

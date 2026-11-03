@@ -10,7 +10,8 @@ import {
     LiquidationRecord,
     OrderbookSnapshot,
     DataGap,
-    RecorderHeartbeat
+    RecorderHeartbeat,
+    DataEpoch
 } from './types';
 
 export class RecorderDB {
@@ -200,7 +201,29 @@ export class RecorderDB {
             );
             CREATE INDEX IF NOT EXISTS idx_rest_metrics_window ON rest_request_metrics(window_5s);
 
-            -- 10. Append-Only Immutability Triggers (Enforce strictly no UPDATE or DELETE on recorded datasets)
+            -- 11. Data Epochs (Append-only metadata marking clean dataset milestones)
+            CREATE TABLE IF NOT EXISTS data_epochs (
+                epoch_id TEXT PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_epochs_started_at ON data_epochs(started_at);
+
+            -- 12. 1-Minute Final Klines (Additive table for strictly closed, verified bars)
+            CREATE TABLE IF NOT EXISTS klines_1m_final (
+                symbol TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                turnover REAL NOT NULL,
+                PRIMARY KEY (symbol, timestamp)
+            );
+            CREATE INDEX IF NOT EXISTS idx_klines_final_sym_ts ON klines_1m_final(symbol, timestamp);
+
+            -- Append-Only Immutability Triggers (Enforce strictly no UPDATE or DELETE on recorded datasets)
             CREATE TRIGGER IF NOT EXISTS abort_update_contract_snapshots BEFORE UPDATE ON contract_snapshots
             BEGIN SELECT RAISE(ABORT, 'Mutation forbidden: table contract_snapshots is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS abort_delete_contract_snapshots BEFORE DELETE ON contract_snapshots
@@ -243,12 +266,30 @@ export class RecorderDB {
 
             CREATE TRIGGER IF NOT EXISTS abort_delete_data_gaps BEFORE DELETE ON data_gaps
             BEGIN SELECT RAISE(ABORT, 'Deletion forbidden: table data_gaps is append-only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS abort_update_data_epochs BEFORE UPDATE ON data_epochs
+            BEGIN SELECT RAISE(ABORT, 'Mutation forbidden: table data_epochs is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS abort_delete_data_epochs BEFORE DELETE ON data_epochs
+            BEGIN SELECT RAISE(ABORT, 'Deletion forbidden: table data_epochs is append-only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS abort_update_klines_1m_final BEFORE UPDATE ON klines_1m_final
+            BEGIN SELECT RAISE(ABORT, 'Mutation forbidden: table klines_1m_final is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS abort_delete_klines_1m_final BEFORE DELETE ON klines_1m_final
+            BEGIN SELECT RAISE(ABORT, 'Deletion forbidden: table klines_1m_final is append-only'); END;
         `);
 
         // Schema migrations for backfill tracking & outage causes
         try { this.db.exec("ALTER TABLE funding_rates ADD COLUMN is_backfilled INTEGER DEFAULT 0"); } catch {}
         try { this.db.exec("ALTER TABLE open_interest ADD COLUMN is_backfilled INTEGER DEFAULT 0"); } catch {}
         try { this.db.exec("ALTER TABLE data_gaps ADD COLUMN cause TEXT"); } catch {}
+
+        // Initialize default clean-data epoch milestone
+        try {
+            this.db.prepare(`
+                INSERT OR IGNORE INTO data_epochs (epoch_id, started_at, description)
+                VALUES ('clean_data_phase2', ?, 'Phase 2: Corrected orderbook snapshot/delta local book, filtered forming klines, throttled open interest')
+            `).run(Date.now());
+        } catch {}
     }
 
     public getRawDb(): Database.Database {
@@ -435,6 +476,80 @@ export class RecorderDB {
             WHERE symbol = ? AND timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp ASC
         `).all(symbol, fromTimestamp, toTimestamp) as Kline1m[];
+    }
+
+    // --- KLINES 1M FINAL (ADDITIVE & VERIFIED) ---
+
+    public insertKlinesFinal(klines: Kline1m[]): number {
+        if (klines.length === 0) return 0;
+        const stmt = this.db.prepare(`
+            INSERT OR IGNORE INTO klines_1m_final (
+                symbol, timestamp, open, high, low, close, volume, turnover
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        let insertedCount = 0;
+        const insertMany = this.db.transaction((items: Kline1m[]) => {
+            for (const k of items) {
+                const info = stmt.run(
+                    k.symbol,
+                    k.timestamp,
+                    k.open,
+                    k.high,
+                    k.low,
+                    k.close,
+                    k.volume,
+                    k.turnover
+                );
+                if (info.changes > 0) insertedCount++;
+            }
+        });
+
+        insertMany(klines);
+        return insertedCount;
+    }
+
+    public getLatestKlineFinalTimestamp(symbol: string): number | null {
+        const row = this.db.prepare(`
+            SELECT MAX(timestamp) as latest FROM klines_1m_final WHERE symbol = ?
+        `).get(symbol) as { latest: number | null } | undefined;
+        return row?.latest ?? null;
+    }
+
+    public getKlinesFinal(symbol: string, fromTimestamp: number, toTimestamp: number): Kline1m[] {
+        return this.db.prepare(`
+            SELECT symbol, timestamp, open, high, low, close, volume, turnover
+            FROM klines_1m_final
+            WHERE symbol = ? AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC
+        `).all(symbol, fromTimestamp, toTimestamp) as Kline1m[];
+    }
+
+    // --- DATA EPOCHS ---
+
+    public insertEpoch(epoch: DataEpoch): void {
+        this.db.prepare(`
+            INSERT OR IGNORE INTO data_epochs (epoch_id, started_at, description)
+            VALUES (?, ?, ?)
+        `).run(epoch.epochId, epoch.startedAt, epoch.description);
+    }
+
+    public getEpochs(): DataEpoch[] {
+        return this.db.prepare(`
+            SELECT epoch_id as epochId, started_at as startedAt, description
+            FROM data_epochs
+            ORDER BY started_at ASC
+        `).all() as DataEpoch[];
+    }
+
+    public getLatestEpoch(): DataEpoch | null {
+        const row = this.db.prepare(`
+            SELECT epoch_id as epochId, started_at as startedAt, description
+            FROM data_epochs
+            ORDER BY started_at DESC
+            LIMIT 1
+        `).get() as DataEpoch | undefined;
+        return row ?? null;
     }
 
     // --- FUNDING RATES ---
@@ -645,12 +760,14 @@ export class RecorderDB {
             'contract_snapshots',
             'listing_events',
             'klines_1m',
+            'klines_1m_final',
             'funding_rates',
             'open_interest',
             'liquidations',
             'orderbook_snapshots',
             'data_gaps',
-            'recorder_heartbeats'
+            'recorder_heartbeats',
+            'data_epochs'
         ];
 
         const counts: Record<string, number> = {};

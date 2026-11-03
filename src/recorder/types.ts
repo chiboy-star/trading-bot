@@ -105,11 +105,27 @@ export interface RecorderHeartbeat {
     details: string;
 }
 
+export interface DataEpoch {
+    epochId: string;
+    startedAt: number;
+    description: string;
+}
+
+export type ShardConnectionStatus = 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED';
+
+export interface ShardInfo {
+    shardId: number;
+    status: ShardConnectionStatus;
+    lastMessageTime: number;
+    topicsCount: number;
+}
+
 export interface DataQualityReport {
     generatedAt: number;
     evaluationWindowMs: number;
     windowStart: number;
     windowEnd: number;
+    epoch?: DataEpoch | null;
     storage: {
         dbPath: string;
         dbSizeBytes: number;

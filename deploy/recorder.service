@@ -1,0 +1,27 @@
+[Unit]
+Description=Bybit Market Data Recorder (24/7 Zero-Cost Dataset Ingestion)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=recorder
+Group=recorder
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=-/opt/trading-bot/.env
+ExecStart=/usr/bin/node /opt/trading-bot/dist/src/recorder/index.js
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+
+# Hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

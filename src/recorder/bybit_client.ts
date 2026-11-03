@@ -36,8 +36,8 @@ export class BybitPublicClient {
     public onRequestMetric?: (timestamp: number, endpoint: string, isSuccess: boolean, errorCode?: number) => void;
 
     constructor(options: BybitClientOptions = {}) {
-        this.primaryHost = options.primaryHost || 'https://api.bybit.com';
-        this.fallbackHost = options.fallbackHost || 'https://api.bytick.com';
+        this.primaryHost = options.primaryHost || process.env.BYBIT_PRIMARY_REST || 'https://api.bytick.com';
+        this.fallbackHost = options.fallbackHost || process.env.BYBIT_FALLBACK_REST || 'https://api.bybit.com';
         this.requestTimeoutMs = options.requestTimeoutMs || 10000;
         this.rateLimitDelayMs = options.rateLimitDelayMs || 50;
         this.maxRetries = options.maxRetries || 3;
@@ -175,7 +175,7 @@ export class BybitPublicClient {
         this.lastRequestTime = Date.now();
     }
 
-    private async fetchJson(endpoint: string, params: Record<string, string | number> = {}): Promise<any> {
+    public async fetchJson(endpoint: string, params: Record<string, string | number> = {}): Promise<any> {
         const now = Date.now();
 
         // 1. Check IP Ban Circuit Breaker
@@ -310,6 +310,12 @@ export class BybitPublicClient {
                         maxRetries: this.maxRetries,
                         err: lastError.message
                     }, 'Bybit REST request attempt failed; switching host / retrying with backoff');
+
+                    // Promote working host when failure occurs
+                    if (host === this.primaryHost) {
+                        this.primaryHost = this.fallbackHost;
+                        this.fallbackHost = host;
+                    }
                 }
             }
 
@@ -438,11 +444,16 @@ export class BybitPublicClient {
 
         const result = await this.fetchJson('/v5/market/kline', params);
         const klines: Kline1m[] = [];
+        const now = Date.now();
 
         if (result && Array.isArray(result.list)) {
             for (const row of result.list) {
                 // Bybit format: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
                 const timestamp = Number(row[0]);
+                // Reject currently forming candles (incomplete volume and price range)
+                if (timestamp + 60000 > now) {
+                    continue;
+                }
                 const open = parseFloat(row[1]);
                 const high = parseFloat(row[2]);
                 const low = parseFloat(row[3]);

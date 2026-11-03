@@ -1,4 +1,4 @@
-import { LiquidationRecord, OrderbookSnapshot } from './types';
+import { LiquidationRecord, OrderbookSnapshot, ShardConnectionStatus, ShardInfo } from './types';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('recorder-ws');
@@ -12,7 +12,16 @@ export interface WSClientOptions {
     shardCapacity?: number;
 }
 
-class SingleWSShard {
+export interface LocalBook {
+    symbol: string;
+    bids: Map<number, number>; // price -> size
+    asks: Map<number, number>; // price -> size
+    lastUpdateId: number;
+    lastSeq?: number;
+    initialized: boolean;
+}
+
+export class SingleWSShard {
     public readonly shardId: number;
     private primaryUrl: string;
     private fallbackUrl: string;
@@ -25,12 +34,22 @@ class SingleWSShard {
     private pingTimer: any = null;
     private reconnectTimeout: any = null;
     private lastMsgTime: number = 0;
+    private hasToggledHostForFailure: boolean = false;
 
+    public jsonParseErrors: number = 0;
+    public messageHandlingErrors: number = 0;
+    public status: ShardConnectionStatus = 'DISCONNECTED';
     public topics: Set<string> = new Set();
     public onMessage?: (msg: any) => void;
-    public onStatusChange?: (shardId: number, status: 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING') => void;
+    public onStatusChange?: (shardId: number, status: ShardConnectionStatus) => void;
 
-    constructor(shardId: number, primaryUrl: string, fallbackUrl: string, pingIntervalMs: number = 20000, maxBackoffMs: number = 60000) {
+    constructor(
+        shardId: number,
+        primaryUrl: string,
+        fallbackUrl: string,
+        pingIntervalMs: number = 20000,
+        maxBackoffMs: number = 60000
+    ) {
         this.shardId = shardId;
         this.primaryUrl = primaryUrl;
         this.fallbackUrl = fallbackUrl;
@@ -47,70 +66,171 @@ class SingleWSShard {
 
     public stop(): void {
         this.isRunning = false;
-        this.clearTimers();
+        this.clearTimers(true);
         if (this.ws) {
-            try { this.ws.close(); } catch {}
+            const old = this.ws;
             this.ws = null;
+            try {
+                old.onopen = null as any;
+                old.onmessage = null as any;
+                old.onclose = null as any;
+                old.onerror = null as any;
+                old.close();
+                if (typeof (old as any).terminate === 'function') (old as any).terminate();
+            } catch {}
         }
+        this.status = 'DISCONNECTED';
         if (this.onStatusChange) this.onStatusChange(this.shardId, 'DISCONNECTED');
     }
 
-    private clearTimers(): void {
-        if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
-        if (this.reconnectTimeout) { clearTimeout(this.reconnectTimeout); this.reconnectTimeout = null; }
+    private clearTimers(includeReconnect: boolean = true): void {
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+        if (includeReconnect && this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
     }
 
     private connect(): void {
         if (!this.isRunning) return;
-        this.clearTimers();
+        this.clearTimers(true);
+        this.status = 'CONNECTING';
 
         try {
-            this.ws = new WebSocket(this.activeUrl);
+            const socket = new WebSocket(this.activeUrl);
+            this.ws = socket;
 
-            this.ws.addEventListener('open', () => {
-                this.backoffMs = 1000;
+            socket.addEventListener('open', () => {
+                if (socket !== this.ws) return;
+                this.status = 'CONNECTED';
                 this.lastMsgTime = Date.now();
+                // NOTE: backoff is NOT reset here; it resets only when a message is received
                 if (this.onStatusChange) this.onStatusChange(this.shardId, 'CONNECTED');
                 this.startPingKeepalive();
                 this.resubscribe();
             });
 
-            this.ws.addEventListener('message', (event) => {
+            socket.addEventListener('message', (event) => {
+                if (socket !== this.ws) return;
                 this.lastMsgTime = Date.now();
+                // Reset backoff and host toggle flag upon receiving data
+                this.backoffMs = 1000;
+                this.hasToggledHostForFailure = false;
+
+                let msg: any;
                 try {
-                    const msg = JSON.parse(event.data);
-                    if (this.onMessage) this.onMessage(msg);
-                } catch {}
+                    msg = JSON.parse(event.data);
+                } catch (err: any) {
+                    this.jsonParseErrors++;
+                    if (this.jsonParseErrors <= 5 || this.jsonParseErrors % 100 === 0) {
+                        log.error({
+                            shardId: this.shardId,
+                            error: err?.message,
+                            parseErrorsCount: this.jsonParseErrors
+                        }, 'WebSocket message JSON parse error');
+                    }
+                    return;
+                }
+
+                // Parse subscribe responses loudly if failed
+                if (msg && msg.op === 'subscribe') {
+                    if (msg.success === false) {
+                        log.error({
+                            shardId: this.shardId,
+                            ret_msg: msg.ret_msg,
+                            conn_id: msg.conn_id,
+                            req_id: msg.req_id
+                        }, '[WS_SUB_FAIL] WebSocket subscription failed on Bybit exchange');
+                    }
+                    return;
+                }
+
+                if (this.onMessage) {
+                    try {
+                        this.onMessage(msg);
+                    } catch (err: any) {
+                        this.messageHandlingErrors++;
+                        log.error({
+                            shardId: this.shardId,
+                            topic: msg?.topic,
+                            err: err?.message || err,
+                            handlingErrorsCount: this.messageHandlingErrors
+                        }, 'WebSocket message processing exception');
+                    }
+                }
             });
 
-            this.ws.addEventListener('close', () => this.scheduleReconnect('Socket closed'));
-            this.ws.addEventListener('error', () => this.scheduleReconnect('Socket error'));
-        } catch {
-            this.scheduleReconnect('Connect exception');
+            socket.addEventListener('close', () => {
+                if (socket !== this.ws) return;
+                this.scheduleReconnect('Socket closed');
+            });
+
+            socket.addEventListener('error', (err: any) => {
+                if (socket !== this.ws) return;
+                this.scheduleReconnect(`Socket error: ${err?.message || 'unknown'}`);
+            });
+        } catch (err: any) {
+            this.scheduleReconnect(`Connect exception: ${err?.message || 'unknown'}`);
         }
     }
 
-    private scheduleReconnect(reason: string): void {
+    public scheduleReconnect(reason: string): void {
         if (!this.isRunning) return;
-        this.clearTimers();
+        if (this.reconnectTimeout !== null) {
+            // Idempotent: a reconnect timer is already pending
+            return;
+        }
+
+        this.status = 'RECONNECTING';
+        this.clearTimers(false);
         if (this.onStatusChange) this.onStatusChange(this.shardId, 'RECONNECTING');
 
-        // Alternate host on failure
-        this.activeUrl = this.activeUrl === this.primaryUrl ? this.fallbackUrl : this.primaryUrl;
-        const delay = this.backoffMs;
+        // Clean up socket
+        if (this.ws) {
+            const old = this.ws;
+            this.ws = null;
+            try {
+                old.onopen = null as any;
+                old.onmessage = null as any;
+                old.onclose = null as any;
+                old.onerror = null as any;
+                old.close();
+                if (typeof (old as any).terminate === 'function') (old as any).terminate();
+            } catch {}
+        }
+
+        // Toggle host only once per failure sequence
+        if (!this.hasToggledHostForFailure) {
+            this.activeUrl = this.activeUrl === this.primaryUrl ? this.fallbackUrl : this.primaryUrl;
+            this.hasToggledHostForFailure = true;
+        }
+
+        // Add ±25% jitter to backoff
+        const jitter = 0.75 + Math.random() * 0.5;
+        const delay = Math.round(this.backoffMs * jitter);
         this.backoffMs = Math.min(this.backoffMs * 2, this.maxBackoffMs);
 
-        this.reconnectTimeout = setTimeout(() => this.connect(), delay);
+        log.warn({ shardId: this.shardId, reason, delay, targetUrl: this.activeUrl }, 'WebSocket shard reconnection scheduled');
+        this.reconnectTimeout = setTimeout(() => {
+            this.reconnectTimeout = null;
+            this.connect();
+        }, delay);
     }
 
     private startPingKeepalive(): void {
         this.pingTimer = setInterval(() => {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
             if (Date.now() - this.lastMsgTime > this.pingIntervalMs * 2) {
+                log.warn({ shardId: this.shardId }, 'WebSocket keepalive timeout; reconnecting shard');
                 this.ws.close();
                 return;
             }
-            try { this.ws.send(JSON.stringify({ op: 'ping' })); } catch {}
+            try {
+                this.ws.send(JSON.stringify({ op: 'ping' }));
+            } catch {}
         }, this.pingIntervalMs);
     }
 
@@ -118,6 +238,16 @@ class SingleWSShard {
         for (const t of newTopics) this.topics.add(t);
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.sendBatch(newTopics);
+        }
+    }
+
+    public resubscribeTopic(topic: string): void {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        try {
+            this.ws.send(JSON.stringify({ op: 'unsubscribe', args: [topic] }));
+            this.ws.send(JSON.stringify({ op: 'subscribe', args: [topic] }));
+        } catch (err: any) {
+            log.warn({ shardId: this.shardId, topic, err: err?.message }, 'Failed to resubscribe topic');
         }
     }
 
@@ -155,9 +285,16 @@ export class BybitPublicWSClient {
     private liquidationCounts: Map<string, number> = new Map();
     private hourlyWindowStart: number = Date.now();
 
+    // Stream freshness timestamps
+    private lastLiquidationEventTime: number = 0;
+    private lastOrderbookTime: number = 0;
+
+    // Local maintained orderbooks per symbol
+    private orderbooks: Map<string, LocalBook> = new Map();
+
     public onLiquidation?: (record: LiquidationRecord) => void;
     public onOrderbook?: (snapshot: OrderbookSnapshot) => void;
-    public onStatus?: (status: 'CONNECTED' | 'DISCONNECTED' | 'RECONNECTING') => void;
+    public onStatus?: (status: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'RECONNECTING', downShards?: number[]) => void;
 
     constructor(options: WSClientOptions = {}) {
         this.primaryUrl = options.primaryUrl || 'wss://stream.bybit.com/v5/public/linear';
@@ -165,15 +302,18 @@ export class BybitPublicWSClient {
         this.pingIntervalMs = options.pingIntervalMs || 20000;
         this.maxBackoffMs = options.maxBackoffMs || 60000;
         this.orderbookSampleIntervalMs = options.orderbookSampleIntervalMs || 10000;
-        this.shardCapacity = options.shardCapacity || 100; // max 100 topics per WS connection to stay well below Bybit limits
+        this.shardCapacity = options.shardCapacity || 100;
     }
 
     public start(): void {
         if (this.isRunning) return;
         this.isRunning = true;
-        for (const shard of this.shards) {
-            shard.start();
-        }
+        // Stagger initial shard starts by ~1s to prevent connection bursts
+        this.shards.forEach((shard, idx) => {
+            setTimeout(() => {
+                if (this.isRunning) shard.start();
+            }, idx * 1000);
+        });
     }
 
     public stop(): void {
@@ -184,26 +324,19 @@ export class BybitPublicWSClient {
         if (this.onStatus) this.onStatus('DISCONNECTED');
     }
 
-    /**
-     * Distributes all active linear contracts into sharded connections.
-     * Guaranteed: ALL active contracts get allLiquidation subscriptions!
-     */
     public setTrackedSymbols(orderbookSymbols: string[], liquidationSymbols: string[]): void {
-        // Stop existing shards if re-configuring
         for (const shard of this.shards) shard.stop();
         this.shards = [];
+        this.orderbooks.clear();
 
-        // Depth topics strictly for BTC, ETH, and <72h new listings
         const depthTopics = orderbookSymbols.map(s => `orderbook.50.${s}`);
         const liqTopics = liquidationSymbols.map(s => `allLiquidation.${s}`);
 
-        // Shard 0 takes orderbook depth topics + initial slice of liquidations
         let currentShard = this.createShard(0);
         currentShard.subscribe(depthTopics);
 
         for (const topic of liqTopics) {
             if (currentShard.topics.size >= this.shardCapacity) {
-                if (this.isRunning) currentShard.start();
                 this.shards.push(currentShard);
                 currentShard = this.createShard(this.shards.length);
             }
@@ -211,8 +344,15 @@ export class BybitPublicWSClient {
         }
 
         if (currentShard.topics.size > 0) {
-            if (this.isRunning) currentShard.start();
             this.shards.push(currentShard);
+        }
+
+        if (this.isRunning) {
+            this.shards.forEach((shard, idx) => {
+                setTimeout(() => {
+                    if (this.isRunning) shard.start();
+                }, idx * 1000);
+            });
         }
 
         log.info({
@@ -223,19 +363,15 @@ export class BybitPublicWSClient {
         }, 'Sharded WebSocket manager configured');
     }
 
-    /**
-     * Dynamically adds newly listed contracts to active shards.
-     */
     public addNewListing(symbol: string, isWithin72h: boolean = true): void {
         const liqTopic = `allLiquidation.${symbol}`;
         const obTopic = isWithin72h ? `orderbook.50.${symbol}` : null;
 
-        // Find shard with remaining capacity
         let targetShard = this.shards.find(s => s.topics.size < this.shardCapacity);
         if (!targetShard) {
             targetShard = this.createShard(this.shards.length);
-            if (this.isRunning) targetShard.start();
             this.shards.push(targetShard);
+            if (this.isRunning) targetShard.start();
         }
 
         const topicsToAdd = [liqTopic];
@@ -257,18 +393,60 @@ export class BybitPublicWSClient {
         shard.onMessage = (msg) => this.handleMessage(msg);
         shard.onStatusChange = (sId, status) => {
             log.info({ shardId: sId, status }, 'WS Shard connection status changed');
-            // If any shard is connected, notify overall connected
-            const anyConnected = this.shards.some(s => s['ws']?.readyState === WebSocket.OPEN);
-            if (this.onStatus) {
-                this.onStatus(anyConnected ? 'CONNECTED' : status);
-            }
+            this.emitAggregateStatus();
         };
 
         return shard;
     }
 
-    private handleMessage(msg: any): void {
-        if (msg.ret_msg === 'pong' || msg.op === 'ping') return;
+    private emitAggregateStatus(): void {
+        if (!this.onStatus) return;
+        const aggregate = this.getAggregateStatus();
+        const downShards = this.getDownShards();
+        this.onStatus(aggregate, downShards);
+    }
+
+    public getAggregateStatus(): 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'RECONNECTING' {
+        if (this.shards.length === 0) return 'DISCONNECTED';
+        const allDisconnected = this.shards.every(s => s.status === 'DISCONNECTED');
+        if (allDisconnected) return 'DISCONNECTED';
+        const connectedCount = this.shards.filter(s => s.status === 'CONNECTED').length;
+        if (connectedCount === this.shards.length) return 'CONNECTED';
+        return 'DEGRADED';
+    }
+
+    public getDownShards(): number[] {
+        return this.shards.filter(s => s.status !== 'CONNECTED').map(s => s.shardId);
+    }
+
+    public getShardsStatus(): ShardInfo[] {
+        return this.shards.map(s => ({
+            shardId: s.shardId,
+            status: s.status,
+            lastMessageTime: s.getLastMessageTime(),
+            topicsCount: s.topics.size
+        }));
+    }
+
+    public getConnectedShardsCount(): number {
+        return this.shards.filter(s => s.status === 'CONNECTED').length;
+    }
+
+    public getShardsCount(): number {
+        return this.shards.length;
+    }
+
+    public resubscribeTopic(topic: string): void {
+        for (const shard of this.shards) {
+            if (shard.topics.has(topic)) {
+                shard.resubscribeTopic(topic);
+                break;
+            }
+        }
+    }
+
+    public handleMessage(msg: any): void {
+        if (!msg || msg.ret_msg === 'pong' || msg.op === 'ping') return;
         const topic = msg.topic;
         if (!topic) return;
 
@@ -276,6 +454,7 @@ export class BybitPublicWSClient {
         if (topic.startsWith('allLiquidation.')) {
             const dataList = Array.isArray(msg.data) ? msg.data : [msg.data];
             const recordedAt = Date.now();
+            this.lastLiquidationEventTime = recordedAt;
 
             for (const item of dataList) {
                 if (!item || !item.s) continue;
@@ -298,10 +477,94 @@ export class BybitPublicWSClient {
             return;
         }
 
-        // 2. ORDERBOOK
+        // 2. ORDERBOOK (Maintained local book with snapshot/delta handling)
         if (topic.startsWith('orderbook.')) {
-            const symbol = msg.data?.s;
+            const symbol = msg.data?.s || topic.split('.').pop() || '';
             if (!symbol) return;
+
+            const msgType = msg.type; // 'snapshot' | 'delta'
+            const updateId = Number(msg.data?.u || 0);
+            const seq = Number(msg.data?.seq || 0);
+
+            let book = this.orderbooks.get(symbol);
+            if (!book) {
+                book = {
+                    symbol,
+                    bids: new Map<number, number>(),
+                    asks: new Map<number, number>(),
+                    lastUpdateId: 0,
+                    initialized: false
+                };
+                this.orderbooks.set(symbol, book);
+            }
+
+            // A. Snapshot or initial load
+            if (msgType === 'snapshot' || updateId === 1) {
+                book.bids.clear();
+                book.asks.clear();
+
+                for (const [pStr, sStr] of (msg.data?.b || [])) {
+                    const price = parseFloat(pStr);
+                    const size = parseFloat(sStr);
+                    if (size > 0) book.bids.set(price, size);
+                }
+                for (const [pStr, sStr] of (msg.data?.a || [])) {
+                    const price = parseFloat(pStr);
+                    const size = parseFloat(sStr);
+                    if (size > 0) book.asks.set(price, size);
+                }
+
+                book.lastUpdateId = updateId;
+                book.lastSeq = seq;
+                book.initialized = true;
+            }
+            // B. Delta update
+            else if (msgType === 'delta') {
+                if (!book.initialized) {
+                    log.warn({ symbol, topic }, 'Received orderbook delta before snapshot. Requesting resubscribe.');
+                    this.resubscribeTopic(topic);
+                    return;
+                }
+
+                // Check continuity: delta updateId must be >= book.lastUpdateId
+                // A gap in sequence or negative spread indicates inconsistency
+                if (book.lastUpdateId > 0 && updateId > 0 && updateId < book.lastUpdateId) {
+                    log.warn({ symbol, currentUpdateId: book.lastUpdateId, receivedUpdateId: updateId }, 'Orderbook update ID out of order. Dropping book.');
+                    book.initialized = false;
+                    book.bids.clear();
+                    book.asks.clear();
+                    this.resubscribeTopic(topic);
+                    return;
+                }
+
+                // Apply bid updates (size 0 = delete)
+                for (const [pStr, sStr] of (msg.data?.b || [])) {
+                    const price = parseFloat(pStr);
+                    const size = parseFloat(sStr);
+                    if (size === 0) {
+                        book.bids.delete(price);
+                    } else {
+                        book.bids.set(price, size);
+                    }
+                }
+
+                // Apply ask updates (size 0 = delete)
+                for (const [pStr, sStr] of (msg.data?.a || [])) {
+                    const price = parseFloat(pStr);
+                    const size = parseFloat(sStr);
+                    if (size === 0) {
+                        book.asks.delete(price);
+                    } else {
+                        book.asks.set(price, size);
+                    }
+                }
+
+                book.lastUpdateId = updateId;
+                if (seq > 0) book.lastSeq = seq;
+            }
+
+            // Periodic sampling of maintained book: 25 best levels every 10s
+            if (!book.initialized) return;
 
             const now = Date.now();
             const lastSampleTime = this.lastSampledOrderbookTime.get(symbol) || 0;
@@ -309,39 +572,86 @@ export class BybitPublicWSClient {
                 return;
             }
 
-            const rawBids = msg.data?.b;
-            const rawAsks = msg.data?.a;
+            // Sort bids descending (highest price first)
+            const sortedBids = Array.from(book.bids.entries())
+                .sort((a, b) => b[0] - a[0])
+                .slice(0, 25);
 
-            if (Array.isArray(rawBids) && Array.isArray(rawAsks) && rawBids.length > 0 && rawAsks.length > 0) {
-                this.lastSampledOrderbookTime.set(symbol, now);
-                const depth = 25;
-                const bids: [number, number][] = rawBids.slice(0, depth).map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]);
-                const asks: [number, number][] = rawAsks.slice(0, depth).map((a: [string, string]) => [parseFloat(a[0]), parseFloat(a[1])]);
+            // Sort asks ascending (lowest price first)
+            const sortedAsks = Array.from(book.asks.entries())
+                .sort((a, b) => a[0] - b[0])
+                .slice(0, 25);
 
-                const bestBid = bids[0][0];
-                const bestAsk = asks[0][0];
-                const spread = parseFloat((bestAsk - bestBid).toFixed(8));
-                const midPrice = parseFloat(((bestBid + bestAsk) / 2).toFixed(8));
-                const timestamp = Number(msg.ts || now);
+            if (sortedBids.length === 0 || sortedAsks.length === 0) {
+                log.warn({ symbol }, 'Maintained orderbook has empty bids or asks. Dropping and resubscribing.');
+                book.initialized = false;
+                this.resubscribeTopic(topic);
+                return;
+            }
 
-                const snapshot: OrderbookSnapshot = {
-                    symbol,
-                    timestamp,
-                    depth,
-                    bids,
-                    asks,
-                    bestBid,
-                    bestAsk,
-                    spread,
-                    midPrice,
-                    recordedAt: now
-                };
+            const bestBid = sortedBids[0][0];
+            const bestAsk = sortedAsks[0][0];
 
-                if (this.onOrderbook) {
-                    this.onOrderbook(snapshot);
-                }
+            // Inconsistency check: spread must be strictly positive
+            if (bestBid >= bestAsk) {
+                log.warn({ symbol, bestBid, bestAsk }, 'Crossed orderbook detected in maintained local book. Dropping and resubscribing.');
+                book.initialized = false;
+                book.bids.clear();
+                book.asks.clear();
+                this.resubscribeTopic(topic);
+                return;
+            }
+
+            this.lastSampledOrderbookTime.set(symbol, now);
+            this.lastOrderbookTime = now;
+
+            const spread = parseFloat((bestAsk - bestBid).toFixed(8));
+            const midPrice = parseFloat(((bestBid + bestAsk) / 2).toFixed(8));
+            const timestamp = Number(msg.ts || now);
+
+            const snapshot: OrderbookSnapshot = {
+                symbol,
+                timestamp,
+                depth: 25,
+                bids: sortedBids,
+                asks: sortedAsks,
+                bestBid,
+                bestAsk,
+                spread,
+                midPrice,
+                recordedAt: now
+            };
+
+            if (this.onOrderbook) {
+                this.onOrderbook(snapshot);
             }
         }
+    }
+
+    public getLocalBook(symbol: string): {
+        symbol: string;
+        bids: [number, number][];
+        asks: [number, number][];
+        initialized: boolean;
+        lastUpdateId: number;
+    } | null {
+        const book = this.orderbooks.get(symbol);
+        if (!book) return null;
+        return {
+            symbol: book.symbol,
+            bids: Array.from(book.bids.entries()).sort((a, b) => b[0] - a[0]),
+            asks: Array.from(book.asks.entries()).sort((a, b) => a[0] - b[0]),
+            initialized: book.initialized,
+            lastUpdateId: book.lastUpdateId
+        };
+    }
+
+    public getLastLiquidationEventTime(): number {
+        return this.lastLiquidationEventTime;
+    }
+
+    public getLastOrderbookTime(): number {
+        return this.lastOrderbookTime;
     }
 
     public getLiquidationEventStats(): {
@@ -374,9 +684,5 @@ export class BybitPublicWSClient {
             maxTime = Math.max(maxTime, s.getLastMessageTime());
         }
         return maxTime;
-    }
-
-    public getShardsCount(): number {
-        return this.shards.length;
     }
 }
