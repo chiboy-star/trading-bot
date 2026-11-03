@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import { CurrencyProvider } from "@/context/CurrencyContext";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -14,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "QuantEngine | Live Multi-Coin Algorithmic Dashboard",
-  description: "Live quantitative paper trading dashboard for BTC, ETH, and SOL with ADX regime filter and dynamic 1.5x ATR trailing stop-loss.",
+  title: "Bybit Market Data Recorder Status",
+  description: "24/7 Bybit public market data recorder telemetry and data quality monitoring.",
 };
 
 export default function RootLayout({
@@ -28,10 +27,8 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
     >
-      <body className="min-h-full flex flex-col">
-        <CurrencyProvider>
-          {children}
-        </CurrencyProvider>
+      <body className="min-h-full flex flex-col bg-[#0E1012] text-[#F3F4F6]">
+        {children}
       </body>
     </html>
   );

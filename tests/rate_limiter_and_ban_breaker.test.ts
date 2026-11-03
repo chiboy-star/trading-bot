@@ -3,8 +3,6 @@ import { GlobalRestRateLimiter } from '../src/recorder/rate_limiter';
 import { BybitPublicClient } from '../src/recorder/bybit_client';
 import { GapFiller } from '../src/recorder/gap_filler';
 import { RecorderDB } from '../src/recorder/db';
-import { TradeWMTBridge } from '../src/tradew_runner';
-import config from '../src/config';
 
 describe('GlobalRestRateLimiter Suite', () => {
     it('should initialize with burst capacity 40 and 20 tokens/sec refill rate', () => {
@@ -174,21 +172,3 @@ describe('Bybit Kline Limit Verification Suite', () => {
     });
 });
 
-describe('TradeW MT5 Safety Hard Block Suite', () => {
-    it('strictly blocks MetaApi live execution when in PAPER mode', async () => {
-        const bridge = new TradeWMTBridge();
-        // Even if connectionMode was somehow set to METAAPI:
-        (bridge as any).connectionMode = 'METAAPI';
-        (bridge as any).rpcConnection = {
-            createMarketOrder: vi.fn()
-        };
-
-        // In default config, app.isLive is false (PAPER mode)
-        expect(config.app.isLive).toBe(false);
-
-        const result = await bridge.executeOrder('ETC/USDT', 'BUY', 0.1, 20.0, 19.5);
-        expect(result.success).toBe(true);
-        // The real createMarketOrder must NEVER be called
-        expect((bridge as any).rpcConnection.createMarketOrder).not.toHaveBeenCalled();
-    });
-});

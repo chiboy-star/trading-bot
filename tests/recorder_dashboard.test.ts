@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { getRecorderDashboardStatus, openReadOnlyRecorderDb } from '../dashboard/lib/recorder_db';
-import { verifyOperatorAuth } from '../dashboard/lib/auth';
 import fs from 'fs';
 import path from 'path';
 
@@ -286,33 +285,3 @@ describe('Recorder Status Page - Data Aggregation & Read-Only Safety', () => {
     });
 });
 
-describe('Dashboard Control Endpoint Auth Security', () => {
-    it('rejects unauthenticated requests with 401', () => {
-        const req = createMockReq({});
-        const res = verifyOperatorAuth(req);
-        expect(res.authorized).toBe(false);
-        expect(res.error).toContain('Unauthorized');
-    });
-
-    it('rejects invalid bearer token or wrong api key', () => {
-        const req = createMockReq({
-            'authorization': 'Bearer wrong_token_12345'
-        });
-        const res = verifyOperatorAuth(req);
-        expect(res.authorized).toBe(false);
-    });
-
-    it('accepts valid operator key via Bearer token and x-api-key', () => {
-        const validKey = process.env.CONTROL_API_KEY || 'dev_operator_key_change_in_production';
-
-        const bearerReq = createMockReq({
-            'authorization': `Bearer ${validKey}`
-        });
-        expect(verifyOperatorAuth(bearerReq).authorized).toBe(true);
-
-        const apiKeyReq = createMockReq({
-            'x-api-key': validKey
-        });
-        expect(verifyOperatorAuth(apiKeyReq).authorized).toBe(true);
-    });
-});
